@@ -123,3 +123,23 @@ apps/tauri/db/
 tasks
 **/*.local.md
 wealthfolio.db
+
+# WealthFolio Brasil local/private data
+*.db
+*.db-shm
+*.db-wal
+*.db.lock
+
+backups/
+__pycache__/
+
+interest_reconstruction_*/
+
+PLANILHA DE INVESTIMENTOS*.xlsx
+
+caixa_dagua_yield_*.py
+evidence_dry_run_*.py
+finalize_observed_interest_*.py
+reconstruct_interest_*.py
+validate_caixa_dagua_*.py
+ledger_approval_gate_*.md
