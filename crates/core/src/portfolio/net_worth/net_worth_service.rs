@@ -69,6 +69,17 @@ impl NetWorthService {
         }
     }
 
+    /// The account group overrides the type-based category: Caixa holds the
+    /// "Conta Rendeira" and "Stablecoin" groups, Investimentos holds "Renda Fixa"
+    /// and "Cripto".
+    fn category_by_account_group(group: Option<&str>) -> Option<AssetCategory> {
+        match group.map(str::trim) {
+            Some("Conta Rendeira") | Some("Stablecoin") => Some(AssetCategory::Cash),
+            Some("Renda Fixa") | Some("Cripto") => Some(AssetCategory::Investment),
+            _ => None,
+        }
+    }
+
     /// Determine the asset category based on AssetKind.
     fn categorize_by_asset_kind(kind: &AssetKind) -> AssetCategory {
         match kind {
@@ -390,7 +401,9 @@ impl NetWorthServiceTrait for NetWorthService {
                 }
             };
 
-            let account_category = Self::categorize_by_account_type(&account.account_type);
+            let group_category = Self::category_by_account_group(account.group.as_deref());
+            let account_category = group_category
+                .unwrap_or_else(|| Self::categorize_by_account_type(&account.account_type));
             let is_liability_account = is_liability_account_type(&account.account_type);
             let stored_account_valuation = if is_liability_account {
                 None
@@ -407,7 +420,7 @@ impl NetWorthServiceTrait for NetWorthService {
                             .investment_market_value_base
                             .round_dp(DECIMAL_PRECISION),
                         valuation_date: account_valuation.valuation_date,
-                        category: AssetCategory::Investment,
+                        category: group_category.unwrap_or(AssetCategory::Investment),
                         is_cash_like: false,
                     });
                 }
@@ -423,7 +436,7 @@ impl NetWorthServiceTrait for NetWorthService {
                         name: Some(account.name.clone()),
                         market_value_base: cash_base,
                         valuation_date: account_valuation.valuation_date,
-                        category: AssetCategory::Cash,
+                        category: group_category.unwrap_or(AssetCategory::Cash),
                         is_cash_like: true,
                     });
                 }
@@ -464,7 +477,9 @@ impl NetWorthServiceTrait for NetWorthService {
                     });
 
                     // Determine category: prefer asset kind if available, fallback to account type
-                    let category = if let Some(asset) = asset {
+                    let category = if let Some(group_category) = group_category {
+                        group_category
+                    } else if let Some(asset) = asset {
                         Self::categorize_by_asset_kind(&asset.kind)
                     } else {
                         account_category
@@ -597,7 +612,7 @@ impl NetWorthServiceTrait for NetWorthService {
                     format!("CASH:{}:{}", account.id, currency),
                     Some(format!("{} ({})", account.name, currency)),
                     cash_base,
-                    AssetCategory::Cash,
+                    group_category.unwrap_or(AssetCategory::Cash),
                 );
 
                 valuations.push(ValuationInfo {
@@ -756,8 +771,19 @@ impl NetWorthServiceTrait for NetWorthService {
                     });
                 entry.value += val.total_value_base;
                 entry.net_contribution += val.net_contribution_base;
-                entry.cash += val.cash_balance_base;
-                entry.investments += val.investment_market_value_base;
+                match Self::category_by_account_group(account.group.as_deref()) {
+                    Some(AssetCategory::Cash) => {
+                        entry.cash += val.cash_balance_base + val.investment_market_value_base;
+                    }
+                    Some(_) => {
+                        entry.investments +=
+                            val.cash_balance_base + val.investment_market_value_base;
+                    }
+                    None => {
+                        entry.cash += val.cash_balance_base;
+                        entry.investments += val.investment_market_value_base;
+                    }
+                }
             }
         }
         let first_portfolio_date = portfolio_by_date.keys().next().copied();
