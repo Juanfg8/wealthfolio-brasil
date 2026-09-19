@@ -972,6 +972,10 @@ impl PerformanceService {
         matches!(account_type, Some(account_types::CASH))
     }
 
+    fn is_crypto_account_type(account_type: Option<&str>) -> bool {
+        matches!(account_type, Some(account_types::CRYPTOCURRENCY))
+    }
+
     fn all_accounts_are_cash(
         account_ids: &[String],
         account_types: &HashMap<String, String>,
@@ -981,6 +985,18 @@ impl PerformanceService {
                 account_types
                     .get(account_id)
                     .is_some_and(|account_type| account_type == account_types::CASH)
+            })
+    }
+
+    fn all_accounts_are_crypto(
+        account_ids: &[String],
+        account_types: &HashMap<String, String>,
+    ) -> bool {
+        !account_ids.is_empty()
+            && account_ids.iter().all(|account_id| {
+                account_types
+                    .get(account_id)
+                    .is_some_and(|account_type| account_type == account_types::CRYPTOCURRENCY)
             })
     }
 
@@ -1679,6 +1695,27 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             baseline,
         );
+        // Income-only holdings scopes (cash / fixed income): snapshot value moves
+        // and transfer legs land on different days, so value-derived returns
+        // absorb capital flows. Report income over average capital instead.
+        if result.is_holdings_mode
+            && result.period.start_date.is_some()
+            && result.attribution.unrealized_pnl_change.is_zero()
+            && !history.is_empty()
+        {
+            let average_value = history
+                .iter()
+                .map(|point| Self::return_total_value(point, ExternalFlowBasis::BaseCurrency))
+                .sum::<Decimal>()
+                / Decimal::from(history.len());
+            if average_value > Decimal::ZERO {
+                result.returns.value_return = Some(
+                    ((result.attribution.income - result.attribution.fees - result.attribution.taxes)
+                        / average_value)
+                        .round_dp(DECIMAL_PRECISION),
+                );
+            }
+        }
         Self::refresh_summary(result);
     }
 
@@ -3041,6 +3078,7 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             PerformanceSummaryProfile::Full,
             Self::is_cash_account_type(account_type),
+            Self::is_crypto_account_type(account_type),
         )?;
         metrics.scope.id = account_id.to_string();
         let attribution_baseline = Self::attribution_baseline(
@@ -3118,9 +3156,14 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             profile,
             Self::is_cash_account_type(account_type),
+            Self::is_crypto_account_type(account_type),
         )?;
         metrics.scope.id = account_id.to_string();
-        if profile == PerformanceSummaryProfile::Dashboard {
+        // Yield/cash holdings accounts still need the income-based return, so only
+        // market-valued or transaction accounts take the cheap dashboard shortcut.
+        if profile == PerformanceSummaryProfile::Dashboard
+            && !(metrics.is_holdings_mode && !Self::is_crypto_account_type(account_type))
+        {
             return Ok(metrics);
         }
 
@@ -3275,6 +3318,7 @@ impl PerformanceService {
             ScopedTrackingComposition::TransactionsOnly => {
                 let cash_fx_attribution_enabled =
                     Self::all_accounts_are_cash(account_ids, account_types);
+                let crypto_only = Self::all_accounts_are_crypto(account_ids, account_types);
                 Self::compute_scoped_account_performance(
                     &full_history,
                     Some(TrackingMode::Transactions),
@@ -3282,11 +3326,13 @@ impl PerformanceService {
                     include_returns_series,
                     profile,
                     cash_fx_attribution_enabled,
+                    crypto_only,
                 )?
             }
             ScopedTrackingComposition::HoldingsOnly => {
                 let cash_fx_attribution_enabled =
                     Self::all_accounts_are_cash(account_ids, account_types);
+                let crypto_only = Self::all_accounts_are_crypto(account_ids, account_types);
                 Self::compute_scoped_account_performance(
                     &full_history,
                     Some(TrackingMode::Holdings),
@@ -3294,6 +3340,7 @@ impl PerformanceService {
                     include_returns_series,
                     profile,
                     cash_fx_attribution_enabled,
+                    crypto_only,
                 )?
             }
             ScopedTrackingComposition::Mixed => {
@@ -3302,7 +3349,9 @@ impl PerformanceService {
         };
 
         metrics.scope.id = scope_id.to_string();
-        if profile == PerformanceSummaryProfile::Dashboard {
+        if profile == PerformanceSummaryProfile::Dashboard
+            && !(metrics.is_holdings_mode && !Self::all_accounts_are_crypto(account_ids, account_types))
+        {
             return Ok(metrics);
         }
 
@@ -3407,6 +3456,7 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             PerformanceSummaryProfile::Full,
             false,
+            false,
         )
     }
 
@@ -3417,6 +3467,7 @@ impl PerformanceService {
         include_returns_series: bool,
         profile: PerformanceSummaryProfile,
         cash_fx_attribution_enabled: bool,
+        crypto_only: bool,
     ) -> Result<PerformanceResult> {
         Self::compute_account_performance_with_flow_basis(
             full_history,
@@ -3426,6 +3477,7 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             profile,
             cash_fx_attribution_enabled,
+            crypto_only,
         )
     }
 
@@ -3437,6 +3489,7 @@ impl PerformanceService {
         flow_basis: ExternalFlowBasis,
         profile: PerformanceSummaryProfile,
         cash_fx_attribution_enabled: bool,
+        crypto_only: bool,
     ) -> Result<PerformanceResult> {
         debug_assert!(full_history.len() >= 2);
 
@@ -3455,7 +3508,30 @@ impl PerformanceService {
         let include_annualized_returns = profile == PerformanceSummaryProfile::Full;
 
         let end_value = Self::return_total_value(end_point, flow_basis);
-        let daily_flows = Self::daily_external_flow_series(full_history, flow_basis);
+        let mut daily_flows = Self::daily_external_flow_series(full_history, flow_basis);
+        if crypto_only {
+            // A crypto manual snapshot can change book basis without any buy,
+            // sell, deposit, or withdrawal. Treat that specific fallback as
+            // no dated flow so market-value movement remains performance,
+            // while explicit acquisition flows remain explicit and count.
+            for (index, flow) in daily_flows.iter_mut().enumerate() {
+                let prev = &full_history[index];
+                let curr = &full_history[index + 1];
+                // Only a basis reset (value barely moved relative to the
+                // flow) is ignored; a real deposit moves value by ~the flow.
+                let flow_amount = flow.inflow + flow.outflow;
+                let value_move = (Self::return_total_value(curr, flow_basis)
+                    - Self::return_total_value(prev, flow_basis))
+                .abs();
+                if curr.external_flow_source == ValuationExternalFlowSource::NetContributionFallback
+                    && value_move * Decimal::TWO < flow_amount
+                {
+                    flow.inflow = Decimal::ZERO;
+                    flow.outflow = Decimal::ZERO;
+                    flow.source = ValuationExternalFlowSource::NetContributionFallback;
+                }
+            }
+        }
         // A transition the valuation layer could not price (Unknown source)
         // makes every dated holdings metric untrustworthy: report unavailable
         // rather than a number with a fabricated or missing flow.
@@ -3464,6 +3540,14 @@ impl PerformanceService {
             && daily_flows
                 .iter()
                 .any(|flow| flow.source.is_unavailable_for_returns());
+        debug!(
+            "Computed holdings performance flow gate account={} crypto_only={} start={:?} degraded_flow_count={} unavailable={}",
+            start_point.account_id,
+            crypto_only,
+            start_date_opt,
+            daily_flows.iter().filter(|flow| flow.source.is_degraded()).count(),
+            holdings_flows_unavailable
+        );
 
         let twr = if is_holdings_mode {
             TwrComputation {
@@ -3527,7 +3611,15 @@ impl PerformanceService {
                 let day_gain = curr_value + flow_outflow - prev_value - flow_inflow;
                 if prev_value > Decimal::ZERO {
                     has_return_base = true;
-                    let daily_return = day_gain / prev_value;
+                    // Crypto deposits are treated as arriving at the start of
+                    // the day, so a large deposit into a near-empty account
+                    // does not inflate that day's return over a tiny base.
+                    let base = if crypto_only {
+                        prev_value + flow_inflow
+                    } else {
+                        prev_value
+                    };
+                    let daily_return = day_gain / base;
                     cumulative_value_factor *= Decimal::ONE + daily_return;
                     if include_risk {
                         risk_samples.push(RiskSample {
@@ -3586,7 +3678,7 @@ impl PerformanceService {
                     start_point,
                     end_point,
                     &daily_flows,
-                    start_date_opt.is_none(),
+                    start_date_opt.is_none() && !crypto_only,
                     flow_basis,
                 ))
             }
@@ -3598,7 +3690,9 @@ impl PerformanceService {
             let (_amount, all_time_return) = holdings_value_return.unwrap();
             // Dated ranges use the chained daily return so the headline equals
             // the returns series' final point; ALL keeps the book-basis ratio.
-            let ret = if start_date_opt.is_none() {
+            // Crypto all-time uses the flow-adjusted chain too: the dated
+            // start-value ratio explodes when the account starts near zero.
+            let ret = if start_date_opt.is_none() && !crypto_only {
                 all_time_return
             } else {
                 holdings_chained_return
@@ -3854,6 +3948,7 @@ impl PerformanceService {
             flow_basis,
             profile,
             Self::is_cash_account_type(component.account_type),
+            false,
         )
     }
 
@@ -5408,6 +5503,45 @@ mod tests {
         valuation.id = format!("{}-{}", account_id, date);
         valuation.account_id = account_id.to_string();
         valuation
+    }
+
+    #[test]
+    fn crypto_holdings_ignore_cost_basis_fallback_and_report_market_return() {
+        let start = account_valuation(
+            "crypto",
+            "2026-04-01",
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(100),
+        );
+        let mut end = account_valuation(
+            "crypto",
+            "2026-04-02",
+            dec!(125),
+            dec!(0),
+            dec!(125),
+            dec!(100),
+        );
+        end.external_outflow_base = dec!(100);
+        end.external_flow_source = ValuationExternalFlowSource::NetContributionFallback;
+
+        let result = PerformanceService::compute_account_performance_with_flow_basis(
+            &[start, end],
+            Some(TrackingMode::Holdings),
+            Some(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()),
+            false,
+            ExternalFlowBasis::BaseCurrency,
+            PerformanceSummaryProfile::Summary,
+            false,
+            true,
+        )
+        .expect("crypto market return should compute");
+
+        assert_eq!(result.returns.value_return, Some(dec!(0.25)));
+        assert_eq!(result.attribution.income, Decimal::ZERO);
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(25));
+        assert!(!result.holdings_flows_unavailable);
     }
 
     fn lot_disposal(
@@ -8557,6 +8691,7 @@ mod tests {
             ExternalFlowBasis::BaseCurrency,
             PerformanceSummaryProfile::Summary,
             false,
+            false,
         )
         .expect("summary should compute");
 
@@ -9826,6 +9961,7 @@ mod tests {
             ExternalFlowBasis::BaseCurrency,
             PerformanceSummaryProfile::Full,
             true,
+            false,
         )
         .expect("foreign cash performance should compute");
 
@@ -9942,6 +10078,7 @@ mod tests {
             ExternalFlowBasis::BaseCurrency,
             PerformanceSummaryProfile::Full,
             true,
+            false,
         )
         .expect("foreign cash performance should compute");
 
