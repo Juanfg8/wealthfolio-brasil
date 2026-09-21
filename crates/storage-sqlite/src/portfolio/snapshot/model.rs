@@ -69,6 +69,15 @@ impl From<&AccountStateSnapshotDB> for SnapshotMetadata {
     }
 }
 
+/// Parses `calculated_at` as written by the app (`...Z`) or by external tools
+/// that emit RFC 3339 offsets (`...+00:00`). Offsets are normalised to UTC.
+fn parse_calculated_at(value: &str) -> Result<NaiveDateTime, chrono::ParseError> {
+    match chrono::DateTime::parse_from_rfc3339(value) {
+        Ok(dt) => Ok(dt.naive_utc()),
+        Err(_) => NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.fZ"),
+    }
+}
+
 impl TryFrom<AccountStateSnapshotDB> for AccountStateSnapshot {
     type Error = StorageError;
 
@@ -95,11 +104,7 @@ impl TryFrom<AccountStateSnapshotDB> for AccountStateSnapshot {
                 .unwrap_or_default(),
             cash_total_base_currency: Decimal::from_str(&db.cash_total_base_currency)
                 .unwrap_or_default(),
-            calculated_at: NaiveDateTime::parse_from_str(
-                &db.calculated_at,
-                "%Y-%m-%dT%H:%M:%S%.fZ",
-            )
-            .unwrap_or_else(|e| {
+            calculated_at: parse_calculated_at(&db.calculated_at).unwrap_or_else(|e| {
                 log::error!(
                     "Failed to parse DB calculated_at '{}': {}",
                     db.calculated_at,
@@ -174,6 +179,34 @@ mod tests {
             .to_string()
             .contains("Invalid snapshot date 'not-a-date'"));
         assert!(error.to_string().contains("account-1"));
+    }
+
+    #[test]
+    fn calculated_at_accepts_app_and_rfc3339_offset_formats() {
+        let expected = NaiveDate::from_ymd_opt(2026, 9, 18)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap();
+        // Format found in 7,567 existing rows (written by external tooling).
+        assert_eq!(
+            parse_calculated_at("2026-09-18T20:00:00.000000+00:00").unwrap(),
+            expected
+        );
+        // Format the app itself writes.
+        assert_eq!(
+            parse_calculated_at("2026-09-18T20:00:00.000000Z").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_calculated_at("2026-09-18T20:00:00Z").unwrap(),
+            expected
+        );
+        // Non-UTC offsets are normalised to UTC.
+        assert_eq!(
+            parse_calculated_at("2026-09-18T17:00:00-03:00").unwrap(),
+            expected
+        );
+        assert!(parse_calculated_at("not a date").is_err());
     }
 }
 
