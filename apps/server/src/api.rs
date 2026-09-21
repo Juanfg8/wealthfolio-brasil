@@ -55,6 +55,7 @@ mod net_worth;
 mod performance;
 pub(crate) mod portable_backups;
 mod portfolio;
+mod pluggy;
 mod portfolios;
 mod secrets;
 mod settings;
@@ -141,6 +142,7 @@ pub fn app_router(state: Arc<AppState>, config: &Config) -> anyhow::Result<Route
     #[allow(unused_mut)]
     let mut protected_api = Router::new()
         .merge(accounts::router())
+        .merge(pluggy::router())
         .merge(portfolios::router())
         .merge(settings::router())
         .merge(data_exports::router())

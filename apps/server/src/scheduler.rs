@@ -175,6 +175,8 @@ pub fn start_background_workers(state: Arc<AppState>) {
         });
     }
 
+    crate::pluggy::start_scheduler(state.clone());
+
     // Start background broker sync scheduler (4-hour interval)
     start_broker_sync_scheduler(state.clone());
 

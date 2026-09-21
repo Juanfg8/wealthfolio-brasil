@@ -11,6 +11,7 @@ mod main_lib;
 pub mod mcp;
 pub mod models;
 pub mod oidc;
+pub mod pluggy;
 pub mod scheduler;
 mod secrets;
 
