@@ -92,6 +92,5 @@ RUN addgroup -S -g 1000 wealthfolio \
  && chown -R wealthfolio:wealthfolio /data
 USER 1000:1000
 
-VOLUME ["/data"]
 EXPOSE 8088
 CMD ["/usr/local/bin/wealthfolio-server"]
