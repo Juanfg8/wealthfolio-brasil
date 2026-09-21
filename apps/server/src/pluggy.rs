@@ -278,6 +278,26 @@ pub struct ReserveState {
     /// Informational reconstruction from the transaction trail at bootstrap (not used as cost).
     #[serde(default)]
     pub reconstruction: Option<Reconstruction>,
+    /// Modeled history behind the bootstrap (kept separate from the observed value).
+    #[serde(default)]
+    pub modeled: Option<ModeledHistory>,
+}
+
+/// User-confirmed operating model used only to seed lifetime performance at the bootstrap:
+/// the pocket is kept at ~`principal` and its yield (`rate_pct`% of CDI) is periodically
+/// withdrawn, so yield accrues on a constant principal instead of compounding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeledHistory {
+    pub principal: f64,
+    pub rate_pct: f64,
+    pub start: String,
+    pub cdi_through: String,
+    /// Modeled lifetime yield = principal x rate% x sum(daily CDI). Realized (withdrawn) and
+    /// unrealized yield alike are return, and performance starts here instead of at zero.
+    pub modeled_yield: f64,
+    /// Pluggy's first observed value (authoritative, never adjusted toward the model).
+    pub observed_value: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -666,6 +686,7 @@ pub fn reserves_of(p: &PluggyAccount) -> Vec<ReserveState> {
                 flow_ids: vec![],
                 last_flow_check: None,
                 reconstruction: None,
+                modeled: None,
             })
         })
         .collect()
@@ -685,6 +706,7 @@ pub fn merge_reserves(old: &[ReserveState], fresh: Vec<ReserveState>) -> Vec<Res
                 n.flow_ids = o.flow_ids.clone();
                 n.last_flow_check = o.last_flow_check.clone();
                 n.reconstruction = o.reconstruction.clone();
+                n.modeled = o.modeled.clone();
             }
             n
         })
@@ -784,6 +806,89 @@ pub fn apply_reserve_flows(
     }
     r.last_flow_check = Some(today.to_string());
     update
+}
+
+/// User-confirmed assumption (2026-09-21): each Caixinha is kept at ~R$5,000 and its yield
+/// at 115% of CDI is periodically withdrawn, throughout 2026 so far.
+pub const MODEL_PRINCIPAL: f64 = 5000.0;
+pub const MODEL_RATE_PCT: f64 = 115.0;
+pub const MODEL_START: &str = "2026-01-01";
+
+/// Only 115%-of-CDI pockets get the modeled history; anything else bootstraps plainly.
+pub fn models_history(r: &ReserveState) -> bool {
+    r.amount > 0.0
+        && r.indexer.as_deref() == Some("CDI")
+        && r.rate_pct.is_some_and(|p| (114.0..=116.0).contains(&p))
+}
+
+/// Yield earned on a constant `principal` at `rate_pct`% of the daily CDI (fractions) over
+/// the business days in `cdi` from `start`. Simple accrual: withdrawn yield does not compound.
+pub fn modeled_yield(
+    principal: f64,
+    rate_pct: f64,
+    start: chrono::NaiveDate,
+    cdi: &BTreeMap<chrono::NaiveDate, f64>,
+) -> f64 {
+    principal * rate_pct / 100.0 * cdi.range(start..).map(|(_, daily)| daily).sum::<f64>()
+}
+
+pub struct ModelSeed {
+    pub modeled_yield: f64,
+    pub cdi_through: String,
+}
+
+/// Official daily CDI (BCB SGS 12, public, no credentials) as fractions per business day.
+async fn fetch_cdi(
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> Result<BTreeMap<chrono::NaiveDate, f64>> {
+    let url = format!(
+        "https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=json&dataInicial={}&dataFinal={}",
+        from.format("%d/%m/%Y"),
+        to.format("%d/%m/%Y")
+    );
+    let rows: Vec<serde_json::Value> = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?
+        .get(url)
+        .send()
+        .await
+        .context("CDI request failed")?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut out = BTreeMap::new();
+    for r in rows {
+        let d = r["data"]
+            .as_str()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%d/%m/%Y").ok());
+        let v = r["valor"].as_str().and_then(|v| v.parse::<f64>().ok());
+        if let (Some(d), Some(v)) = (d, v) {
+            out.insert(d, v / 100.0);
+        }
+    }
+    if out.is_empty() {
+        bail!("empty CDI series");
+    }
+    Ok(out)
+}
+
+/// After a plain bootstrap (cost = observed value), move cost so the first observation
+/// shows the modeled lifetime yield instead of zero: cost = observed - modeled yield. The
+/// observed value stays authoritative; whatever separates it from the model (withdrawals,
+/// principal moves) lands in cost, so it is neither return nor a portfolio flow.
+pub fn apply_modeled_history(r: &mut ReserveState, seed: &ModelSeed) {
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    r.cost_basis = Some(round2((r.amount - seed.modeled_yield).max(0.0)));
+    r.cost_origin = Some("MODELED_HISTORY".into());
+    r.modeled = Some(ModeledHistory {
+        principal: MODEL_PRINCIPAL,
+        rate_pct: MODEL_RATE_PCT,
+        start: MODEL_START.into(),
+        cdi_through: seed.cdi_through.clone(),
+        modeled_yield: round2(seed.modeled_yield),
+        observed_value: r.amount,
+    });
 }
 
 /// A Caixinha becomes its own manual-priced position (never merged into cash, since
@@ -1324,6 +1429,36 @@ async fn sync_inner(
     //     The first pass bootstraps cost from the current value and needs the full trail;
     //     later passes fetch only a few days back. Cost never follows the value.
     let today_str = today.format("%Y-%m-%d").to_string();
+    let needs_model = st
+        .accounts
+        .values()
+        .filter(|a| a.kind == "BANK")
+        .filter(|a| {
+            st.items
+                .get(&a.item_id)
+                .is_some_and(|l| l.status == LinkStatus::Linked)
+        })
+        .flat_map(|a| a.reserves.iter())
+        .any(|r| r.cost_basis.is_none() && models_history(r));
+    let model_seed: Option<ModelSeed> = if needs_model {
+        let start = chrono::NaiveDate::parse_from_str(MODEL_START, "%Y-%m-%d").unwrap_or(today);
+        match fetch_cdi(start, today).await {
+            Ok(cdi) => Some(ModelSeed {
+                modeled_yield: modeled_yield(MODEL_PRINCIPAL, MODEL_RATE_PCT, start, &cdi),
+                cdi_through: cdi
+                    .keys()
+                    .next_back()
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default(),
+            }),
+            Err(e) => {
+                warn!("Official CDI unavailable; Caixinha bootstrap deferred: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     for acc in st
         .accounts
         .values_mut()
@@ -1357,9 +1492,17 @@ async fn sync_inner(
         match client.paged::<PluggyTransaction>("/transactions", &q).await {
             Ok(txs) => {
                 for r in acc.reserves.iter_mut() {
+                    let wants_model = r.cost_basis.is_none() && models_history(r);
+                    if wants_model && model_seed.is_none() {
+                        continue; // CDI unavailable: stay unbootstrapped so no snapshot is written
+                    }
                     let u = apply_reserve_flows(r, &txs, &today_str);
                     if u.bootstrapped {
-                        info!("Pluggy reserve bootstrapped (cost basis = first observed value)");
+                        match (&model_seed, wants_model) {
+                            (Some(seed), true) => apply_modeled_history(r, seed),
+                            _ => {}
+                        }
+                        info!("Pluggy reserve bootstrapped");
                     }
                 }
             }
@@ -2054,6 +2197,7 @@ mod tests {
             flow_ids: vec![],
             last_flow_check: None,
             reconstruction: None,
+            modeled: None,
         }
     }
 
@@ -2211,5 +2355,95 @@ mod tests {
         assert!(rec.min_running_principal < 0.0);
         assert_eq!(r.cost_origin.as_deref(), Some("BOOTSTRAP")); // fell back, did not use net flows
         assert_eq!(r.cost_basis, Some(4881.22));
+    }
+    /// 60 business days from 2026-01-02 at 0.05% CDI/day (synthetic).
+    fn synthetic_cdi() -> BTreeMap<chrono::NaiveDate, f64> {
+        let mut m = BTreeMap::new();
+        let mut d = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        while m.len() < 60 {
+            if d.format("%u").to_string().parse::<u8>().unwrap() <= 5 {
+                m.insert(d, 0.0005);
+            }
+            d += chrono::Duration::days(1);
+        }
+        m
+    }
+
+    fn seed() -> ModelSeed {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        ModelSeed {
+            modeled_yield: modeled_yield(MODEL_PRINCIPAL, MODEL_RATE_PCT, start, &synthetic_cdi()),
+            cdi_through: "2026-03-27".into(),
+        }
+    }
+
+    #[test]
+    fn historical_115_cdi_yield_exists_from_2026_01_01_without_compounding() {
+        let y = seed().modeled_yield;
+        assert!((y - 5000.0 * 1.15 * 0.0005 * 60.0).abs() < 1e-9); // 172.50, simple accrual
+        let compounded = 5000.0 * ((1.0_f64 + 1.15 * 0.0005).powi(60) - 1.0);
+        assert!(y > 100.0 && y < compounded); // real yield; withdrawn yield does not compound
+    }
+
+    #[test]
+    fn first_pluggy_observation_keeps_modeled_yield_and_pluggy_value() {
+        let sd = seed();
+        let mut r = pocket(4881.22); // observed BELOW 5,000 is allowed: Pluggy wins
+        r.indexer = Some("CDI".into());
+        assert!(models_history(&r));
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        apply_modeled_history(&mut r, &sd);
+        let (value, perf) = value_and_gain(&r);
+        assert_eq!(value, Decimal::new(488122, 2)); // current value stays the Pluggy value
+        assert_eq!(perf, Decimal::new(17250, 2)); // performance starts at the modeled yield, not 0
+        assert_eq!(r.cost_basis, Some(4708.72)); // the gap to the model sits in cost, not in return
+        assert_eq!(r.cost_origin.as_deref(), Some("MODELED_HISTORY"));
+        let m = r.modeled.unwrap();
+        assert_eq!(
+            (m.principal, m.rate_pct, m.modeled_yield),
+            (5000.0, 115.0, 172.5)
+        );
+        assert_eq!(m.observed_value, 4881.22);
+    }
+
+    #[test]
+    fn after_the_seed_flows_and_yield_withdrawals_are_neutral_and_growth_accumulates() {
+        let sd = seed();
+        let mut r = pocket(4881.22);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        apply_modeled_history(&mut r, &sd);
+        let g0 = value_and_gain(&r).1;
+        // +500 moved in (value +500, +2 yield): performance moves by the yield only.
+        let mut a = merge_reserves(std::slice::from_ref(&r), vec![pocket(5383.22)]).remove(0);
+        apply_reserve_flows(
+            &mut a,
+            &[flow_tx("in", true, 500.0, "2026-09-22T00:00:00.000Z")],
+            "2026-09-22",
+        );
+        assert_eq!(value_and_gain(&a).1 - g0, Decimal::from(2));
+        // -300 moved back to cash (value -300, +1 yield): realized return, not a loss.
+        let mut b = merge_reserves(std::slice::from_ref(&a), vec![pocket(5084.22)]).remove(0);
+        apply_reserve_flows(
+            &mut b,
+            &[flow_tx("out", false, 300.0, "2026-09-23T00:00:00.000Z")],
+            "2026-09-23",
+        );
+        assert_eq!(value_and_gain(&b).1 - g0, Decimal::from(3));
+        // plain value growth keeps accumulating on top of the modeled gain
+        let mut c = merge_reserves(std::slice::from_ref(&b), vec![pocket(5089.22)]).remove(0);
+        apply_reserve_flows(&mut c, &[], "2026-09-24");
+        assert_eq!(value_and_gain(&c).1 - g0, Decimal::from(8));
+    }
+
+    #[test]
+    fn only_115_cdi_pockets_get_the_modeled_history() {
+        let mut other = pocket(1000.0);
+        other.indexer = Some("CDI".into());
+        other.rate_pct = Some(120.0);
+        assert!(!models_history(&other));
+        other.rate_pct = Some(114.9992);
+        assert!(models_history(&other));
+        other.indexer = Some("SELIC".into());
+        assert!(!models_history(&other));
     }
 }

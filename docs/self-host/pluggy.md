@@ -47,10 +47,18 @@ item to an existing **HOLDINGS-mode** Wealthfolio account. Each sync then writes
 - **pocket cost basis is tracked, never derived from value**: Pluggy exposes no principal for
   `reservedBalances`, and the "Dinheiro reservado/retirado" trail proved incomplete on both real Caixinhas
   (running principal goes negative; simulating it at 100% CDI overshoots Pluggy's value), so cost is
-  bootstrapped from the first observed value (`costOrigin=BOOTSTRAP`) and then moves only with new flows:
+  bootstrapped at the first observation and then moves only with new flows:
   reserved +cost, retired -cost (floor 0). Yield = value - cost, so a sync that reports a higher value raises
   the return instead of resetting it, and cash<->pocket moves are flow-neutral. Flow ids are remembered so a
   movement is never counted twice; a pocket that cannot be bootstrapped blocks the item's snapshot;
+- **modeled history seed (user-confirmed operating model)**: each Caixinha is kept at ~R$5,000 with its
+  yield (115% CDI) periodically withdrawn. At the bootstrap, for 115%-of-CDI pockets, the lifetime yield is
+  modeled as `5000 x 1.15 x sum(daily CDI)` from 2026-01-01 (official BCB SGS 12 series, simple accrual, no
+  compounding) and cost is set to `observed value - modeled yield` (`costOrigin=MODELED_HISTORY`). The first
+  observation therefore shows the modeled lifetime yield instead of zero; the observed value stays exactly
+  Pluggy's (it may be below 5,000); the gap between observed and modeled lands in cost, so it is neither
+  return nor a flow; yield withdrawn back to cash is realized return, never a loss. If the CDI series is
+  unreachable, the bootstrap (and that item's snapshot) is deferred and retried;
 - an empty result (no positions, pockets or cash) never writes a snapshot.
 
 ## Sync cadence
