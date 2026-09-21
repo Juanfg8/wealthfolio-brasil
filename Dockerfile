@@ -67,6 +67,7 @@ COPY crates ./crates
 COPY apps/server ./apps/server
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 ENV OPENSSL_STATIC=1
+ENV CARGO_BUILD_JOBS=2
 # Build using xx-cargo which handles target flags
 RUN xx-cargo build --locked --release --manifest-path apps/server/Cargo.toml && \
     # Move the binary to a predictable location because the target dir changes with --target
