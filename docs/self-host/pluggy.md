@@ -40,7 +40,11 @@ item to an existing **HOLDINGS-mode** Wealthfolio account. Each sync then writes
   Pluggy's `balance` is net of IR/IOF (`amount - taxes - taxes2`); existing manual balances track gross;
 - the item's BANK account balances are written as cash in the same snapshot; snapshots carry no net
   contribution and create no activities, so this is flow-neutral and adds no transaction history;
-- an empty result (no positions and no cash) never writes a snapshot.
+- **reserved pockets** (`bankData.reservedBalances`, e.g. Mercado Pago Caixinhas) are written as their own
+  positions, never merged into cash: Pluggy's account `balance` excludes them (verified: the sum of all
+  transactions since inception equals `balance` while reservations appear as debits), and they earn a
+  different rate than the current account. Each keeps its own rate (e.g. 115% CDI) in the asset name;
+- an empty result (no positions, pockets or cash) never writes a snapshot.
 
 ## Credit cards
 

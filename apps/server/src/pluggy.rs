@@ -89,6 +89,38 @@ pub struct PluggyAccount {
     pub balance: Option<f64>,
     pub currency_code: Option<String>,
     pub credit_data: Option<PluggyCreditData>,
+    pub bank_data: Option<PluggyBankData>,
+}
+
+/// Open Finance "saldo reservado": pockets such as Mercado Pago Caixinhas. They are
+/// exposed here, remunerated separately, and are NOT included in `balance`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyBankData {
+    pub reserved_balances: Option<Vec<PluggyReserved>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyReserved {
+    pub name: Option<String>,
+    pub identification: Option<String>,
+    pub available_amounts: Option<Vec<PluggyReservedAmount>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyReservedAmount {
+    pub amount: Option<f64>,
+    pub currency_code: Option<String>,
+    pub remuneration: Option<PluggyRemuneration>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyRemuneration {
+    pub indexer: Option<String>,
+    pub post_fixed_indexer_percentage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,6 +232,21 @@ pub struct AccountState {
     /// Latest card invoices (most recent first), recorded for review.
     #[serde(default)]
     pub bills: Vec<BillState>,
+    /// Reserved pockets (Caixinhas) held outside `balance`; each is its own position.
+    #[serde(default)]
+    pub reserves: Vec<ReserveState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReserveState {
+    pub id: String,
+    pub name: String,
+    pub amount: f64,
+    pub currency: String,
+    /// Contracted rate as a percentage of the indexer (115 = 115% of CDI).
+    pub rate_pct: Option<f64>,
+    pub indexer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,13 +563,92 @@ pub fn drop_existing(
 
 /// Stable UUID per Pluggy investment so repeated syncs reuse the same asset.
 pub fn asset_id_for_investment(investment_id: &str) -> String {
+    derive_asset_id(&format!("pluggy:investment:{investment_id}"))
+}
+
+fn derive_asset_id(seed: &str) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(format!("pluggy:investment:{investment_id}"));
+    let hash = Sha256::digest(seed.as_bytes());
     let mut b = [0u8; 16];
     b.copy_from_slice(&hash[..16]);
     b[6] = (b[6] & 0x0f) | 0x50; // version 5-style
     b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
     uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// Extracts the account's reserved pockets. Pluggy expresses the indexer percentage as
+/// a fraction (1.15 = 115%), so it is normalised to a percentage.
+pub fn reserves_of(p: &PluggyAccount) -> Vec<ReserveState> {
+    let Some(list) = p
+        .bank_data
+        .as_ref()
+        .and_then(|b| b.reserved_balances.as_ref())
+    else {
+        return vec![];
+    };
+    list.iter()
+        .filter_map(|r| {
+            let amounts = r.available_amounts.as_deref().unwrap_or(&[]);
+            let amount: f64 = amounts.iter().filter_map(|a| a.amount).sum();
+            let first = amounts.first();
+            let rem = first.and_then(|a| a.remuneration.as_ref());
+            let name = r.name.clone()?;
+            Some(ReserveState {
+                id: r
+                    .identification
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{name}", p.id)),
+                name,
+                amount,
+                currency: first
+                    .and_then(|a| a.currency_code.clone())
+                    .or_else(|| p.currency_code.clone())
+                    .unwrap_or_else(|| "BRL".into()),
+                rate_pct: rem.and_then(|m| m.post_fixed_indexer_percentage).map(|v| {
+                    if v <= 3.0 {
+                        v * 100.0
+                    } else {
+                        v
+                    }
+                }),
+                indexer: rem.and_then(|m| m.indexer.clone()),
+            })
+        })
+        .collect()
+}
+
+/// A Caixinha becomes its own manual-priced position (never merged into cash, since
+/// it earns a different rate). Cost is unknown here, so it equals current value.
+pub fn map_reserve(account_name: &str, r: &ReserveState) -> Option<ManualHoldingInput> {
+    let amount = Decimal::from_f64_retain(r.amount)?.round_dp(2);
+    if amount <= Decimal::ZERO {
+        return None;
+    }
+    let short: String =
+        r.id.chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(8)
+            .collect();
+    let rate = match (r.rate_pct, r.indexer.as_deref()) {
+        (Some(p), Some(i)) => format!(" ({p:.1}% {i})"),
+        _ => String::new(),
+    };
+    Some(ManualHoldingInput {
+        asset_id: Some(derive_asset_id(&format!("pluggy:reserve:{}", r.id))),
+        symbol: format!("PLUGGY-{}", short.to_uppercase()),
+        exchange_mic: None,
+        quantity: Decimal::ONE,
+        currency: r.currency.clone(),
+        average_cost: amount,
+        unit_price: Some(amount),
+        name: Some(format!("{account_name} · {}{rate}", r.name)),
+        data_source: Some("MANUAL".into()),
+        asset_kind: Some("INVESTMENT".into()),
+        quote_ccy: Some(r.currency.clone()),
+        instrument_type: None,
+        provider_id: None,
+        provider_symbol: None,
+    })
 }
 
 /// Which Pluggy value becomes a position's market value. Pluggy's `amount` is
@@ -791,8 +917,10 @@ async fn sync_inner(
                     available_credit: None,
                     due_date: None,
                     bills: vec![],
+                    reserves: vec![],
                 });
             entry.institution = institution.clone();
+            entry.reserves = reserves_of(&p);
             entry.credit_limit = p.credit_data.as_ref().and_then(|c| c.credit_limit);
             entry.available_credit = p
                 .credit_data
@@ -1026,12 +1154,18 @@ async fn sync_inner(
                 Some("linked account is not in HOLDINGS tracking mode; skipped".into());
             continue;
         }
-        let positions: Vec<ManualHoldingInput> = st
+        let mut positions: Vec<ManualHoldingInput> = st
             .investments
             .iter()
             .filter(|i| i.item_id == link.item_id)
             .filter_map(|i| map_investment(i, basis))
             .collect();
+        positions.extend(
+            st.accounts
+                .values()
+                .filter(|a| a.item_id == link.item_id && a.kind == "BANK")
+                .flat_map(|a| a.reserves.iter().filter_map(|r| map_reserve(&a.name, r))),
+        );
         let mut cash: BTreeMap<String, Decimal> = BTreeMap::new();
         for a in st
             .accounts
@@ -1389,6 +1523,7 @@ mod tests {
             balance: None,
             currency_code: None,
             credit_data: None,
+            bank_data: None,
         }
     }
 
@@ -1604,5 +1739,54 @@ mod tests {
             vec!["mp"]
         );
         assert!(match_names(&["Unknown Bank"], &existing).is_empty());
+    }
+    // Trimmed from the real payload of a Mercado Pago account (amounts kept, ids shortened).
+    const MP_ACCOUNT: &str = r#"{
+      "id":"acc","type":"BANK","subtype":"CHECKING_ACCOUNT","name":"Mercado Pago (Conta Pré-paga)",
+      "balance":7254.3,"currencyCode":"BRL",
+      "bankData":{"closingBalance":7254.3,"automaticallyInvestedBalance":7254.3,"hasReservedBalance":true,
+        "reservedBalances":[
+          {"name":"Carro","identification":"5f381d08-aaaa","availableAmounts":[{"amount":0,"currencyCode":"BRL","remuneration":{"indexer":"CDI","postFixedIndexerPercentage":1.149451}}]},
+          {"name":"Reserva de Emergência","identification":"f61f3795-bbbb","availableAmounts":[{"amount":5008.3,"currencyCode":"BRL","remuneration":{"indexer":"CDI","postFixedIndexerPercentage":1.149992}}]}]}}"#;
+
+    #[test]
+    fn caixinhas_are_read_from_reserved_balances_with_percentage_rate() {
+        let p: PluggyAccount = serde_json::from_str(MP_ACCOUNT).unwrap();
+        let r = reserves_of(&p);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1].name, "Reserva de Emergência");
+        assert_eq!(r[1].amount, 5008.3);
+        assert!((r[1].rate_pct.unwrap() - 114.9992).abs() < 1e-6);
+        assert_eq!(r[1].indexer.as_deref(), Some("CDI"));
+    }
+
+    #[test]
+    fn caixinha_is_a_separate_position_and_never_part_of_cash() {
+        let p: PluggyAccount = serde_json::from_str(MP_ACCOUNT).unwrap();
+        let positions: Vec<_> = reserves_of(&p)
+            .iter()
+            .filter_map(|r| map_reserve("Mercado Pago", r))
+            .collect();
+        assert_eq!(positions.len(), 1); // the empty "Carro" pocket is skipped
+        let h = &positions[0];
+        assert_eq!(h.quantity * h.unit_price.unwrap(), Decimal::new(500830, 2));
+        assert!(h.name.as_deref().unwrap().contains("Reserva de Emergência"));
+        assert!(h.name.as_deref().unwrap().contains("115.0% CDI"));
+        // available balance stays a separate figure (cash) and is not added to the pocket
+        assert_eq!(p.balance, Some(7254.3));
+        // stable, distinct asset id
+        assert_eq!(
+            h.asset_id,
+            map_reserve("x", &reserves_of(&p)[1]).unwrap().asset_id
+        );
+        assert_ne!(
+            h.asset_id.as_deref(),
+            Some(asset_id_for_investment("f61f3795-bbbb").as_str())
+        );
+    }
+
+    #[test]
+    fn accounts_without_reserved_balances_yield_none() {
+        assert!(reserves_of(&acct("BANK", "x")).is_empty());
     }
 }
