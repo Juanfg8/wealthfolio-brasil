@@ -24,9 +24,27 @@ Redeploy after setting. A sync runs 90 s after boot, then every 6 h.
    with `source_system=PLUGGY` and `idempotency_key=pluggy:<accountId>:<txId>`.
    Re-running never duplicates. Pending transactions are ignored.
 
+## Investments (per Pluggy item)
+
+Investments belong to an institution (item), not to a bank account.
+`POST /api/v1/pluggy/investment-links` `{"itemId","accountId"}` (or `{"itemId","ignore":true}`) links an
+item to an existing **HOLDINGS-mode** Wealthfolio account. Each sync then writes one holdings snapshot
+(dated today, replaced on re-sync) through the same path as the Holdings UI:
+
+- one manual-priced custom asset per Pluggy investment, symbol `PLUGGY-<id8>` (never a real ticker),
+  deterministic asset id, so re-syncs reuse the asset;
+- quantity from Pluggy (or 1 unit of full value if quantity is 0/missing), price = balance / quantity;
+- cost basis = current value (Pluggy has no reliable cost), so no unrealized gain is shown;
+- an empty result never writes a snapshot.
+
+## Balance reconciliation
+
+For each linked bank account `balanceCheck` in `/status` compares the Pluggy balance with Wealthfolio's
+cash: `OK`, `DRIFT` (with `diff`) or `UNKNOWN`. It never changes data; valuations recalculate
+asynchronously, so a fresh import may read `DRIFT`/`UNKNOWN` until the next sync.
+
 ## Limits
 
 - Linked account must be in TRANSACTIONS tracking mode, else it is skipped with `lastError`.
-- Investments and balances are read and exposed in `/status` only (not written to holdings).
 - Credit cards/invoices are not imported.
 - Existing accounts/activities are never modified by the sync.

@@ -60,9 +60,28 @@ async fn link(
     .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemLinkRequest {
+    item_id: String,
+    account_id: Option<String>,
+    #[serde(default)]
+    ignore: bool,
+}
+
+async fn link_item(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ItemLinkRequest>,
+) -> ApiResult<Json<pluggy::ItemLink>> {
+    pluggy::apply_item_link(&state, &req.item_id, req.account_id.as_deref(), req.ignore)
+        .map(Json)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/pluggy/status", get(status))
         .route("/pluggy/sync", post(sync))
         .route("/pluggy/links", post(link))
+        .route("/pluggy/investment-links", post(link_item))
 }

@@ -21,6 +21,10 @@ use tracing::{info, warn};
 use wealthfolio_core::{
     accounts::{Account, AccountServiceTrait, TrackingMode},
     activities::{ActivityBulkMutationRequest, NewActivity},
+    portfolio::snapshot::{
+        ManualHoldingInput, ManualSnapshotRequest, ManualSnapshotService, SnapshotSource,
+    },
+    utils::time_utils::{parse_user_timezone_or_default, user_today},
 };
 
 use crate::main_lib::AppState;
@@ -145,6 +149,35 @@ pub struct AccountState {
     pub candidates: Vec<String>,
     pub last_synced_at: Option<String>,
     pub last_error: Option<String>,
+    /// Read-only comparison of the Pluggy balance with Wealthfolio's cash; never auto-corrected.
+    #[serde(default)]
+    pub balance_check: Option<BalanceCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceCheck {
+    pub pluggy: Option<f64>,
+    pub wealthfolio: Option<f64>,
+    pub diff: Option<f64>,
+    /// OK | DRIFT | UNKNOWN
+    pub status: String,
+    pub checked_at: String,
+}
+
+/// Investments belong to a Pluggy item (institution), not to a bank account, so
+/// they are linked per item to a HOLDINGS-mode Wealthfolio account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemLink {
+    pub item_id: String,
+    pub institution: Option<String>,
+    pub status: LinkStatus,
+    pub linked_account_id: Option<String>,
+    pub positions_written: usize,
+    pub total_value: Option<f64>,
+    pub last_synced_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +204,8 @@ pub struct RunSummary {
     pub transactions_seen: usize,
     pub activities_created: usize,
     pub activities_skipped_existing: usize,
+    #[serde(default)]
+    pub investment_positions_written: usize,
     pub error: Option<String>,
 }
 
@@ -179,6 +214,8 @@ pub struct RunSummary {
 pub struct PluggyState {
     pub accounts: BTreeMap<String, AccountState>,
     pub investments: Vec<InvestmentState>,
+    #[serde(default)]
+    pub items: BTreeMap<String, ItemLink>,
     pub last_run: Option<RunSummary>,
 }
 
@@ -318,6 +355,77 @@ pub fn drop_existing(
     (fresh, skipped)
 }
 
+/// Stable UUID per Pluggy investment so repeated syncs reuse the same asset.
+pub fn asset_id_for_investment(investment_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(format!("pluggy:investment:{investment_id}"));
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&hash[..16]);
+    b[6] = (b[6] & 0x0f) | 0x50; // version 5-style
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// Maps a Pluggy investment to a manual-priced custom position. The symbol is
+/// namespaced (`PLUGGY-<id>`) so it can never collide with a real ticker, and the
+/// cost basis equals current value because Pluggy exposes no reliable cost.
+pub fn map_investment(i: &InvestmentState) -> Option<ManualHoldingInput> {
+    let balance = Decimal::from_f64_retain(i.balance?)?.round_dp(2);
+    if balance <= Decimal::ZERO {
+        return None;
+    }
+    let quantity = i
+        .quantity
+        .and_then(Decimal::from_f64_retain)
+        .filter(|q| *q > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    let currency = i.currency.clone().unwrap_or_else(|| "BRL".into());
+    let short: String =
+        i.id.chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(8)
+            .collect();
+    let name = match (&i.name, &i.code) {
+        (Some(n), Some(c)) => format!("{n} ({c})"),
+        (Some(n), None) => n.clone(),
+        (None, Some(c)) => c.clone(),
+        _ => format!("Pluggy investment {short}"),
+    };
+    Some(ManualHoldingInput {
+        asset_id: Some(asset_id_for_investment(&i.id)),
+        symbol: format!("PLUGGY-{}", short.to_uppercase()),
+        exchange_mic: None,
+        quantity,
+        currency: currency.clone(),
+        average_cost: (balance / quantity).round_dp(6),
+        name: Some(name),
+        data_source: Some("MANUAL".into()),
+        asset_kind: Some("INVESTMENT".into()),
+        quote_ccy: Some(currency),
+        instrument_type: None,
+        provider_id: None,
+        provider_symbol: None,
+    })
+}
+
+pub fn reconcile_balance(pluggy: Option<f64>, wealthfolio: Option<f64>) -> BalanceCheck {
+    let diff = pluggy
+        .zip(wealthfolio)
+        .map(|(p, w)| ((p - w) * 100.0).round() / 100.0);
+    let status = match diff {
+        None => "UNKNOWN",
+        Some(d) if d.abs() <= 0.01 => "OK",
+        Some(_) => "DRIFT",
+    };
+    BalanceCheck {
+        pluggy,
+        wealthfolio,
+        diff,
+        status: status.into(),
+        checked_at: Utc::now().to_rfc3339(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pluggy HTTP client
 // ---------------------------------------------------------------------------
@@ -436,6 +544,17 @@ async fn sync_inner(
     let mut investments = Vec::new();
     for item_id in &cfg.item_ids {
         let institution = client.institution(item_id).await;
+        let link = st.items.entry(item_id.clone()).or_insert_with(|| ItemLink {
+            item_id: item_id.clone(),
+            institution: None,
+            status: LinkStatus::NeedsReview,
+            linked_account_id: None,
+            positions_written: 0,
+            total_value: None,
+            last_synced_at: None,
+            last_error: None,
+        });
+        link.institution = institution.clone();
         let accounts: Vec<PluggyAccount> = client
             .paged("/accounts", &[("itemId", item_id.clone())])
             .await?;
@@ -460,6 +579,7 @@ async fn sync_inner(
                     candidates: vec![],
                     last_synced_at: None,
                     last_error: None,
+                    balance_check: None,
                 });
             entry.institution = institution.clone();
             entry.name = p
@@ -489,7 +609,12 @@ async fn sync_inner(
                 quantity: i.quantity,
                 currency: i.currency_code,
             })),
-            Err(e) => warn!("Pluggy investments unavailable for an item: {e}"),
+            Err(e) => {
+                warn!("Pluggy investments unavailable for an item: {e}");
+                if let Some(l) = st.items.get_mut(item_id) {
+                    l.last_error = Some(format!("investments fetch failed: {e}"));
+                }
+            }
         }
     }
     st.investments = investments;
@@ -566,6 +691,85 @@ async fn sync_inner(
             summary.activities_created += n;
         }
         acc.last_synced_at = Some(Utc::now().to_rfc3339());
+        let wf_cash = state
+            .valuation_service
+            .get_latest_valuations(std::slice::from_ref(&wf_id))
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .and_then(|v| v.cash_balance.to_string().parse::<f64>().ok());
+        acc.balance_check = Some(reconcile_balance(acc.balance, wf_cash));
+    }
+
+    // 3. Investments for explicitly linked items -> snapshot on a HOLDINGS-mode account.
+    let timezone = state.timezone.read().unwrap().clone();
+    let today = user_today(parse_user_timezone_or_default(&timezone));
+    let base_currency = state.base_currency.read().unwrap().clone();
+    for link in st
+        .items
+        .values_mut()
+        .filter(|l| l.status == LinkStatus::Linked)
+    {
+        let Some(wf_id) = link.linked_account_id.clone() else {
+            continue;
+        };
+        let wf = match state.account_service.get_account(&wf_id) {
+            Ok(a) => a,
+            Err(e) => {
+                link.last_error = Some(format!("linked account unavailable: {e}"));
+                continue;
+            }
+        };
+        if wf.tracking_mode != TrackingMode::Holdings {
+            link.last_error =
+                Some("linked account is not in HOLDINGS tracking mode; skipped".into());
+            continue;
+        }
+        let positions: Vec<ManualHoldingInput> = st
+            .investments
+            .iter()
+            .filter(|i| i.item_id == link.item_id)
+            .filter_map(map_investment)
+            .collect();
+        // Never write an empty snapshot: it would zero out the account.
+        if positions.is_empty() {
+            link.last_error = Some("no Pluggy positions returned; snapshot not written".into());
+            continue;
+        }
+        let total: f64 = st
+            .investments
+            .iter()
+            .filter(|i| i.item_id == link.item_id)
+            .filter_map(|i| i.balance)
+            .filter(|b| *b > 0.0)
+            .sum();
+        let n = positions.len();
+        let saved = ManualSnapshotService::new(
+            state.asset_service.clone(),
+            state.fx_service.clone(),
+            state.snapshot_service.clone(),
+            state.quote_service.clone(),
+        )
+        .with_timezone(timezone.clone())
+        .save_manual_snapshot(ManualSnapshotRequest {
+            account_id: wf_id.clone(),
+            account_currency: wf.currency.clone(),
+            snapshot_date: today,
+            positions,
+            cash_balances: vec![],
+            base_currency: Some(base_currency.clone()),
+            source: SnapshotSource::ManualEntry,
+        })
+        .await;
+        match saved {
+            Ok(_) => {
+                link.last_error = None;
+                link.positions_written = n;
+                link.total_value = Some(total);
+                link.last_synced_at = Some(Utc::now().to_rfc3339());
+                summary.investment_positions_written += n;
+            }
+            Err(e) => link.last_error = Some(format!("snapshot write failed: {e}")),
+        }
     }
     info!(
         "Pluggy sync: {} accounts, {} activities created, {} already present",
@@ -616,6 +820,45 @@ pub fn apply_link(
         );
     }
     let out = acc.clone();
+    save_state(&state.data_root, &st)?;
+    Ok(out)
+}
+
+/// Explicit user decision for a Pluggy item's investments: link to an existing
+/// HOLDINGS-mode Wealthfolio account, or ignore.
+pub fn apply_item_link(
+    state: &Arc<AppState>,
+    item_id: &str,
+    account_id: Option<&str>,
+    ignore: bool,
+) -> Result<ItemLink> {
+    let mut st = load_state(&state.data_root);
+    if let Some(wf_id) = account_id {
+        let wf = state.account_service.get_account(wf_id)?;
+        if wf.tracking_mode != TrackingMode::Holdings {
+            bail!("account must be in HOLDINGS tracking mode to receive Pluggy investments");
+        }
+        if st
+            .items
+            .values()
+            .any(|l| l.item_id != item_id && l.linked_account_id.as_deref() == Some(wf_id))
+        {
+            bail!("Wealthfolio account already linked to another Pluggy item");
+        }
+    }
+    let link = st
+        .items
+        .get_mut(item_id)
+        .ok_or_else(|| anyhow!("unknown Pluggy item (run a sync first)"))?;
+    if ignore {
+        link.status = LinkStatus::Ignored;
+        link.linked_account_id = None;
+    } else {
+        let wf_id = account_id.ok_or_else(|| anyhow!("accountId required"))?;
+        link.status = LinkStatus::Linked;
+        link.linked_account_id = Some(wf_id.to_string());
+    }
+    let out = link.clone();
     save_state(&state.data_root, &st)?;
     Ok(out)
 }
@@ -743,6 +986,62 @@ mod tests {
         let (again, skipped) = drop_existing(batch(), &existing);
         assert!(again.is_empty());
         assert_eq!(skipped, 3);
+    }
+
+    fn inv(id: &str, balance: Option<f64>, qty: Option<f64>) -> InvestmentState {
+        InvestmentState {
+            id: id.into(),
+            item_id: "item".into(),
+            kind: Some("ETF".into()),
+            subtype: None,
+            name: Some("BOVA11".into()),
+            code: Some("BOVA11".into()),
+            balance,
+            quantity: qty,
+            currency: Some("BRL".into()),
+        }
+    }
+
+    #[test]
+    fn investment_asset_id_is_deterministic_and_valid_uuid() {
+        let a = asset_id_for_investment("abc");
+        assert_eq!(a, asset_id_for_investment("abc"));
+        assert_ne!(a, asset_id_for_investment("abd"));
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
+    }
+
+    #[test]
+    fn maps_investments_with_namespaced_symbol_and_unit_price() {
+        let h = map_investment(&inv("9df10577-9b13", Some(1359.39), Some(3.0))).unwrap();
+        assert_eq!(h.symbol, "PLUGGY-9DF10577");
+        assert_eq!(h.quantity, Decimal::from(3));
+        assert_eq!(h.average_cost, Decimal::new(45313, 2)); // 1359.39 / 3
+        assert_eq!(h.data_source.as_deref(), Some("MANUAL"));
+        assert_eq!(h.asset_id, Some(asset_id_for_investment("9df10577-9b13")));
+    }
+
+    #[test]
+    fn zero_or_missing_quantity_falls_back_to_one_unit_of_full_value() {
+        for q in [None, Some(0.0)] {
+            let h = map_investment(&inv("x1", Some(118.4), q)).unwrap();
+            assert_eq!(h.quantity, Decimal::ONE);
+            assert_eq!(h.average_cost, Decimal::new(11840, 2));
+        }
+    }
+
+    #[test]
+    fn skips_investments_without_positive_balance() {
+        assert!(map_investment(&inv("x", None, Some(1.0))).is_none());
+        assert!(map_investment(&inv("x", Some(0.0), Some(1.0))).is_none());
+        assert!(map_investment(&inv("x", Some(-5.0), Some(1.0))).is_none());
+    }
+
+    #[test]
+    fn balance_check_flags_drift_and_unknown() {
+        assert_eq!(reconcile_balance(Some(100.0), Some(100.0)).status, "OK");
+        let d = reconcile_balance(Some(28939.6), Some(28839.6));
+        assert_eq!((d.status.as_str(), d.diff), ("DRIFT", Some(100.0)));
+        assert_eq!(reconcile_balance(Some(1.0), None).status, "UNKNOWN");
     }
 
     #[test]
