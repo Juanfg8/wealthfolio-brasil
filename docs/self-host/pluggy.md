@@ -44,7 +44,20 @@ item to an existing **HOLDINGS-mode** Wealthfolio account. Each sync then writes
   positions, never merged into cash: Pluggy's account `balance` excludes them (verified: the sum of all
   transactions since inception equals `balance` while reservations appear as debits), and they earn a
   different rate than the current account. Each keeps its own rate (e.g. 115% CDI) in the asset name;
+- **pocket cost basis is tracked, never derived from value**: Pluggy exposes no principal for
+  `reservedBalances`, and the "Dinheiro reservado/retirado" trail proved incomplete on both real Caixinhas
+  (running principal goes negative; simulating it at 100% CDI overshoots Pluggy's value), so cost is
+  bootstrapped from the first observed value (`costOrigin=BOOTSTRAP`) and then moves only with new flows:
+  reserved +cost, retired -cost (floor 0). Yield = value - cost, so a sync that reports a higher value raises
+  the return instead of resetting it, and cash<->pocket moves are flow-neutral. Flow ids are remembered so a
+  movement is never counted twice; a pocket that cannot be bootstrapped blocks the item's snapshot;
 - an empty result (no positions, pockets or cash) never writes a snapshot.
+
+## Sync cadence
+
+MeuPluggy proxy items refresh once every 24 h (`nextAutoSyncAt = lastUpdatedAt + 24h`). The scheduler
+therefore runs every 12 h by default (`PLUGGY_SYNC_INTERVAL_HOURS`, min 1); more polling only spends API calls.
+Never call `PATCH /items/{id}` on a schedule.
 
 ## Credit cards
 

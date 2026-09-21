@@ -32,7 +32,17 @@ use crate::main_lib::AppState;
 
 const PLUGGY_API: &str = "https://api.pluggy.ai";
 pub const SOURCE_SYSTEM: &str = "PLUGGY";
-const SYNC_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// MeuPluggy proxies refresh about once a day, so polling more often only spends API calls.
+const DEFAULT_SYNC_INTERVAL_HOURS: u64 = 12;
+
+fn sync_interval() -> Duration {
+    let hours = std::env::var("PLUGGY_SYNC_INTERVAL_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SYNC_INTERVAL_HOURS)
+        .max(1);
+    Duration::from_secs(hours * 60 * 60)
+}
 
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -247,6 +257,40 @@ pub struct ReserveState {
     /// Contracted rate as a percentage of the indexer (115 = 115% of CDI).
     pub rate_pct: Option<f64>,
     pub indexer: Option<String>,
+    /// Net contributed capital (principal). Independent of `amount`: it only moves with
+    /// new reserve flows, so accrued yield (`amount - cost_basis`) is never reset.
+    #[serde(default)]
+    pub cost_basis: Option<f64>,
+    /// How `cost_basis` was established. `BOOTSTRAP` = the value at first observation,
+    /// used because Pluggy exposes no principal and the flow trail is not reliable.
+    #[serde(default)]
+    pub cost_origin: Option<String>,
+    #[serde(default)]
+    pub bootstrap_date: Option<String>,
+    #[serde(default)]
+    pub bootstrap_value: Option<f64>,
+    /// Ids of reserve flows already accounted for (never counted twice).
+    #[serde(default)]
+    pub flow_ids: Vec<String>,
+    /// Day of the last successful flow check; the next fetch starts a few days earlier.
+    #[serde(default)]
+    pub last_flow_check: Option<String>,
+    /// Informational reconstruction from the transaction trail at bootstrap (not used as cost).
+    #[serde(default)]
+    pub reconstruction: Option<Reconstruction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Reconstruction {
+    pub reserved: f64,
+    pub retired: f64,
+    pub net_flows: f64,
+    pub flow_count: usize,
+    /// Lowest running principal with same-day flows netted. Negative means the trail is
+    /// incomplete (a pocket cannot hold negative principal), so it is not reliable.
+    pub min_running_principal: f64,
+    pub reliable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +327,9 @@ pub struct ItemLink {
     /// Existing Wealthfolio account ids that look like this institution (never auto-applied).
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// When Pluggy last refreshed this item (MeuPluggy proxies refresh about daily).
+    #[serde(default)]
+    pub pluggy_updated_at: Option<String>,
     pub total_value: Option<f64>,
     pub last_synced_at: Option<String>,
     pub last_error: Option<String>,
@@ -612,13 +659,135 @@ pub fn reserves_of(p: &PluggyAccount) -> Vec<ReserveState> {
                     }
                 }),
                 indexer: rem.and_then(|m| m.indexer.clone()),
+                cost_basis: None,
+                cost_origin: None,
+                bootstrap_date: None,
+                bootstrap_value: None,
+                flow_ids: vec![],
+                last_flow_check: None,
+                reconstruction: None,
             })
         })
         .collect()
 }
 
+/// Fresh Pluggy values replace `amount`/rate, but everything cost-related is carried over
+/// from the persisted state so a sync can never reset accumulated return.
+pub fn merge_reserves(old: &[ReserveState], fresh: Vec<ReserveState>) -> Vec<ReserveState> {
+    fresh
+        .into_iter()
+        .map(|mut n| {
+            if let Some(o) = old.iter().find(|o| o.id == n.id) {
+                n.cost_basis = o.cost_basis;
+                n.cost_origin = o.cost_origin.clone();
+                n.bootstrap_date = o.bootstrap_date.clone();
+                n.bootstrap_value = o.bootstrap_value;
+                n.flow_ids = o.flow_ids.clone();
+                n.last_flow_check = o.last_flow_check.clone();
+                n.reconstruction = o.reconstruction.clone();
+            }
+            n
+        })
+        .collect()
+}
+
+/// A reserve movement: `(into_pocket, pocket_name, amount)`. Mercado Pago writes
+/// "Dinheiro reservado <pocket>" (debit from cash) and "Dinheiro retirado <pocket>" (credit).
+/// Rows whose sign contradicts their wording, or that are not posted, are ignored.
+pub fn reserve_flow(tx: &PluggyTransaction) -> Option<(bool, String, f64)> {
+    if tx.status.as_deref().is_some_and(|s| s != "POSTED") {
+        return None;
+    }
+    let d = tx.description.as_deref()?.trim();
+    let lower = d.to_lowercase();
+    let (into, rest) = if lower.starts_with("dinheiro reservado ") {
+        (true, &d["dinheiro reservado ".len()..])
+    } else if lower.starts_with("dinheiro retirado ") {
+        (false, &d["dinheiro retirado ".len()..])
+    } else {
+        return None;
+    };
+    if (into && tx.amount >= 0.0) || (!into && tx.amount <= 0.0) {
+        return None;
+    }
+    Some((into, rest.trim().to_string(), tx.amount.abs()))
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct FlowUpdate {
+    pub bootstrapped: bool,
+    pub contributed: f64,
+    pub withdrawn: f64,
+}
+
+/// Keeps a pocket's cost basis independent of its (Pluggy-authoritative) value.
+/// First call bootstraps cost = current value and records every existing flow as already
+/// accounted for; later calls only apply flows not seen before: money moved into the
+/// pocket raises cost, money moved out lowers it (never below zero). Yield is whatever
+/// value exceeds cost, so contributions/withdrawals are never mistaken for return.
+pub fn apply_reserve_flows(
+    r: &mut ReserveState,
+    txs: &[PluggyTransaction],
+    today: &str,
+) -> FlowUpdate {
+    let flows: Vec<(String, bool, f64, String)> = txs
+        .iter()
+        .filter_map(|t| {
+            let (into, name, amt) = reserve_flow(t)?;
+            (name == r.name).then(|| (t.id.clone(), into, amt, t.date.chars().take(10).collect()))
+        })
+        .collect();
+    let mut update = FlowUpdate::default();
+    if r.cost_basis.is_none() {
+        // Informational only: net flows with same-day movements netted.
+        let mut by_day: BTreeMap<&str, f64> = BTreeMap::new();
+        for (_, into, amt, day) in &flows {
+            *by_day.entry(day.as_str()).or_default() += if *into { *amt } else { -*amt };
+        }
+        let (mut run, mut low) = (0.0_f64, 0.0_f64);
+        for v in by_day.values() {
+            run += v;
+            low = low.min(run);
+        }
+        let reserved: f64 = flows.iter().filter(|f| f.1).map(|f| f.2).sum();
+        let retired: f64 = flows.iter().filter(|f| !f.1).map(|f| f.2).sum();
+        r.reconstruction = Some(Reconstruction {
+            reserved,
+            retired,
+            net_flows: reserved - retired,
+            flow_count: flows.len(),
+            min_running_principal: (low * 100.0).round() / 100.0,
+            reliable: low >= -0.01,
+        });
+        r.cost_basis = Some(r.amount);
+        r.cost_origin = Some("BOOTSTRAP".into());
+        r.bootstrap_date = Some(today.to_string());
+        r.bootstrap_value = Some(r.amount);
+        r.flow_ids = flows.iter().map(|f| f.0.clone()).collect();
+        update.bootstrapped = true;
+    } else {
+        let mut cost = r.cost_basis.unwrap_or(r.amount);
+        for (id, into, amt, _) in &flows {
+            if r.flow_ids.contains(id) {
+                continue;
+            }
+            r.flow_ids.push(id.clone());
+            if *into {
+                cost += amt;
+                update.contributed += amt;
+            } else {
+                cost = (cost - amt).max(0.0);
+                update.withdrawn += amt;
+            }
+        }
+        r.cost_basis = Some((cost * 100.0).round() / 100.0);
+    }
+    r.last_flow_check = Some(today.to_string());
+    update
+}
+
 /// A Caixinha becomes its own manual-priced position (never merged into cash, since
-/// it earns a different rate). Cost is unknown here, so it equals current value.
+/// it earns a different rate).
 pub fn map_reserve(account_name: &str, r: &ReserveState) -> Option<ManualHoldingInput> {
     let amount = Decimal::from_f64_retain(r.amount)?.round_dp(2);
     if amount <= Decimal::ZERO {
@@ -639,7 +808,12 @@ pub fn map_reserve(account_name: &str, r: &ReserveState) -> Option<ManualHolding
         exchange_mic: None,
         quantity: Decimal::ONE,
         currency: r.currency.clone(),
-        average_cost: amount,
+        // Cost is the tracked principal, never the current value: yield = value - cost.
+        average_cost: r
+            .cost_basis
+            .and_then(Decimal::from_f64_retain)
+            .map(|c| c.round_dp(2))
+            .unwrap_or(amount),
         unit_price: Some(amount),
         name: Some(format!("{account_name} · {}{rate}", r.name)),
         data_source: Some("MANUAL".into()),
@@ -822,9 +996,22 @@ impl Client {
         }
     }
 
-    async fn institution(&self, item_id: &str) -> Option<String> {
-        let v: serde_json::Value = self.get(&format!("/items/{item_id}"), &[]).await.ok()?;
-        v["connector"]["name"].as_str().map(str::to_string)
+    /// `(connector name, lastUpdatedAt)` of an item.
+    async fn item_meta(&self, item_id: &str) -> (Option<String>, Option<String>) {
+        let v: Option<serde_json::Value> = self.get(&format!("/items/{item_id}"), &[]).await.ok();
+        let field = |v: &serde_json::Value, p: &[&str]| {
+            p.iter()
+                .try_fold(v, |acc, k| acc.get(*k))
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        };
+        match v {
+            Some(v) => (
+                field(&v, &["connector", "name"]),
+                field(&v, &["lastUpdatedAt"]),
+            ),
+            None => (None, None),
+        }
     }
 }
 
@@ -867,7 +1054,7 @@ async fn sync_inner(
     // 1. Discover accounts + investments (read-only).
     let mut investments = Vec::new();
     for item_id in &cfg.item_ids {
-        let connector = client.institution(item_id).await;
+        let (connector, item_updated_at) = client.item_meta(item_id).await;
         let accounts: Vec<PluggyAccount> = client
             .paged("/accounts", &[("itemId", item_id.clone())])
             .await?;
@@ -879,11 +1066,13 @@ async fn sync_inner(
             linked_account_id: None,
             positions_written: 0,
             candidates: vec![],
+            pluggy_updated_at: None,
             total_value: None,
             last_synced_at: None,
             last_error: None,
         });
         link.institution = institution.clone();
+        link.pluggy_updated_at = item_updated_at;
         let mut names: Vec<&str> = institution.iter().map(String::as_str).collect();
         names.extend(
             accounts
@@ -920,7 +1109,7 @@ async fn sync_inner(
                     reserves: vec![],
                 });
             entry.institution = institution.clone();
-            entry.reserves = reserves_of(&p);
+            entry.reserves = merge_reserves(&entry.reserves, reserves_of(&p));
             entry.credit_limit = p.credit_data.as_ref().and_then(|c| c.credit_limit);
             entry.available_credit = p
                 .credit_data
@@ -1131,6 +1320,53 @@ async fn sync_inner(
         acc.balance_check = Some(reconcile_balance(expected, wf_cash));
     }
 
+    // 2b. Reserve pockets of linked items: keep principal in step with new reserve flows.
+    //     The first pass bootstraps cost from the current value and needs the full trail;
+    //     later passes fetch only a few days back. Cost never follows the value.
+    let today_str = today.format("%Y-%m-%d").to_string();
+    for acc in st
+        .accounts
+        .values_mut()
+        .filter(|a| a.kind == "BANK" && !a.reserves.is_empty())
+    {
+        if !st
+            .items
+            .get(&acc.item_id)
+            .is_some_and(|l| l.status == LinkStatus::Linked)
+        {
+            continue;
+        }
+        let bootstrap = acc.reserves.iter().any(|r| r.cost_basis.is_none());
+        let mut q = vec![("accountId", acc.id.clone())];
+        if !bootstrap {
+            let from = acc
+                .reserves
+                .iter()
+                .filter_map(|r| r.last_flow_check.as_deref())
+                .min()
+                .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .map(|d| {
+                    (d - chrono::Duration::days(3))
+                        .format("%Y-%m-%d")
+                        .to_string()
+                });
+            if let Some(from) = from {
+                q.push(("from", from));
+            }
+        }
+        match client.paged::<PluggyTransaction>("/transactions", &q).await {
+            Ok(txs) => {
+                for r in acc.reserves.iter_mut() {
+                    let u = apply_reserve_flows(r, &txs, &today_str);
+                    if u.bootstrapped {
+                        info!("Pluggy reserve bootstrapped (cost basis = first observed value)");
+                    }
+                }
+            }
+            Err(e) => warn!("Pluggy reserve flows unavailable: {e}"),
+        }
+    }
+
     // 3. Linked items -> one snapshot (active positions + the item's bank cash) on a
     //    HOLDINGS-mode account. Snapshots carry no net contribution, so this is
     //    flow-neutral and adds no transaction history.
@@ -1152,6 +1388,20 @@ async fn sync_inner(
         if wf.tracking_mode != TrackingMode::Holdings {
             link.last_error =
                 Some("linked account is not in HOLDINGS tracking mode; skipped".into());
+            continue;
+        }
+        if st
+            .accounts
+            .values()
+            .filter(|a| a.item_id == link.item_id && a.kind == "BANK")
+            .flat_map(|a| a.reserves.iter())
+            .any(|r| r.amount > 0.0 && r.cost_basis.is_none())
+        {
+            // Writing cost = value would erase future yield; retry once flows are readable.
+            link.last_error = Some(
+                "reserve cost basis not bootstrapped (flows unavailable); snapshot not written"
+                    .into(),
+            );
             continue;
         }
         let mut positions: Vec<ManualHoldingInput> = st
@@ -1358,7 +1608,7 @@ pub fn start_scheduler(state: Arc<AppState>) {
     }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(90)).await;
-        let mut tick = tokio::time::interval(Duration::from_secs(SYNC_INTERVAL_SECS));
+        let mut tick = tokio::time::interval(sync_interval());
         loop {
             tick.tick().await;
             if let Err(e) = run_sync(&state).await {
@@ -1788,5 +2038,178 @@ mod tests {
     #[test]
     fn accounts_without_reserved_balances_yield_none() {
         assert!(reserves_of(&acct("BANK", "x")).is_empty());
+    }
+    fn pocket(amount: f64) -> ReserveState {
+        ReserveState {
+            id: "res-1".into(),
+            name: "Investimentos 2".into(),
+            amount,
+            currency: "BRL".into(),
+            rate_pct: Some(114.9992),
+            indexer: Some("CDI".into()),
+            cost_basis: None,
+            cost_origin: None,
+            bootstrap_date: None,
+            bootstrap_value: None,
+            flow_ids: vec![],
+            last_flow_check: None,
+            reconstruction: None,
+        }
+    }
+
+    fn flow_tx(id: &str, moved_in: bool, amount: f64, day: &str) -> PluggyTransaction {
+        let (desc, signed) = if moved_in {
+            ("Dinheiro reservado Investimentos 2", -amount)
+        } else {
+            ("Dinheiro retirado Investimentos 2", amount)
+        };
+        let mut t = tx(
+            id,
+            if moved_in { "DEBIT" } else { "CREDIT" },
+            signed,
+            day,
+            Some("POSTED"),
+        );
+        t.description = Some(desc.into());
+        t
+    }
+
+    /// Value and gain (value - cost) exactly as the snapshot would record them.
+    fn value_and_gain(r: &ReserveState) -> (Decimal, Decimal) {
+        let h = map_reserve("Mercado Pago 2", r).unwrap();
+        let value = h.quantity * h.unit_price.unwrap();
+        (value, value - h.quantity * h.average_cost)
+    }
+
+    #[test]
+    fn first_sync_bootstraps_cost_from_value_and_marks_it() {
+        let mut r = pocket(4881.22);
+        let txs = vec![flow_tx("a", true, 500.0, "2026-02-11T00:00:00.000Z")];
+        let u = apply_reserve_flows(&mut r, &txs, "2026-09-21");
+        assert!(u.bootstrapped);
+        assert_eq!(r.cost_basis, Some(4881.22));
+        assert_eq!(r.cost_origin.as_deref(), Some("BOOTSTRAP"));
+        assert_eq!(r.bootstrap_value, Some(4881.22));
+        assert_eq!(r.flow_ids, vec!["a".to_string()]); // history is not counted again later
+        let (value, gain) = value_and_gain(&r);
+        assert_eq!((value, gain), (Decimal::new(488122, 2), Decimal::ZERO));
+    }
+
+    #[test]
+    fn second_sync_with_higher_value_raises_gain_and_keeps_cost() {
+        let mut r = pocket(4881.22);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        // Next sync: Pluggy reports a higher reserved balance, no new flows.
+        let mut next = merge_reserves(std::slice::from_ref(&r), vec![pocket(4886.10)]).remove(0);
+        let u = apply_reserve_flows(&mut next, &[], "2026-09-22");
+        assert!(!u.bootstrapped);
+        assert_eq!(next.cost_basis, Some(4881.22)); // cost NOT overwritten by the new value
+        let (value, gain) = value_and_gain(&next);
+        assert_eq!(value, Decimal::new(488610, 2));
+        assert_eq!(gain, Decimal::new(488, 2)); // +4.88 of accrued yield, not reset to 0
+                                                // and it keeps growing across further syncs
+        let mut third =
+            merge_reserves(std::slice::from_ref(&next), vec![pocket(4891.02)]).remove(0);
+        apply_reserve_flows(&mut third, &[], "2026-09-23");
+        assert_eq!(value_and_gain(&third).1, Decimal::new(980, 2));
+    }
+
+    #[test]
+    fn contributions_and_withdrawals_move_cost_not_return() {
+        let mut r = pocket(1000.0);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        // +500 moved into the pocket; value rises by the same 500 (plus 2 of yield).
+        let mut a = merge_reserves(std::slice::from_ref(&r), vec![pocket(1502.0)]).remove(0);
+        let up = apply_reserve_flows(
+            &mut a,
+            &[flow_tx("in1", true, 500.0, "2026-09-22T00:00:00.000Z")],
+            "2026-09-22",
+        );
+        assert_eq!(up.contributed, 500.0);
+        assert_eq!(a.cost_basis, Some(1500.0));
+        assert_eq!(value_and_gain(&a).1, Decimal::from(2)); // only the yield is return
+                                                            // -300 moved out to cash; value falls by 300 (plus 1 of yield).
+        let mut b = merge_reserves(std::slice::from_ref(&a), vec![pocket(1203.0)]).remove(0);
+        let dn = apply_reserve_flows(
+            &mut b,
+            &[flow_tx("out1", false, 300.0, "2026-09-23T00:00:00.000Z")],
+            "2026-09-23",
+        );
+        assert_eq!(dn.withdrawn, 300.0);
+        assert_eq!(b.cost_basis, Some(1200.0));
+        assert_eq!(value_and_gain(&b).1, Decimal::from(3)); // a withdrawal is not negative return
+    }
+
+    #[test]
+    fn a_flow_is_never_counted_twice() {
+        let mut r = pocket(1000.0);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        let t = flow_tx("dup", true, 250.0, "2026-09-22T00:00:00.000Z");
+        apply_reserve_flows(&mut r, std::slice::from_ref(&t), "2026-09-22");
+        apply_reserve_flows(&mut r, &[t.clone(), t], "2026-09-23");
+        assert_eq!(r.cost_basis, Some(1250.0));
+    }
+
+    #[test]
+    fn other_pockets_pending_and_inconsistent_rows_are_ignored() {
+        let mut r = pocket(1000.0);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        let mut other = flow_tx("o", true, 100.0, "2026-09-22T00:00:00.000Z");
+        other.description = Some("Dinheiro reservado Carro".into());
+        let mut pending = flow_tx("p", true, 100.0, "2026-09-22T00:00:00.000Z");
+        pending.status = Some("PENDING".into());
+        let wrong_sign = tx(
+            "w",
+            "CREDIT",
+            100.0,
+            "2026-09-22T00:00:00.000Z",
+            Some("POSTED"),
+        );
+        let mut wrong = wrong_sign;
+        wrong.description = Some("Dinheiro reservado Investimentos 2".into()); // credit cannot be a reservation
+        apply_reserve_flows(&mut r, &[other, pending, wrong], "2026-09-22");
+        assert_eq!(r.cost_basis, Some(1000.0));
+    }
+
+    #[test]
+    fn cost_survives_the_resync_merge_but_value_and_rate_refresh() {
+        let mut r = pocket(1000.0);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        let mut fresh = pocket(1010.0);
+        fresh.rate_pct = Some(115.0);
+        let merged = merge_reserves(&[r], vec![fresh]).remove(0);
+        assert_eq!(merged.amount, 1010.0);
+        assert_eq!(merged.rate_pct, Some(115.0));
+        assert_eq!(merged.cost_basis, Some(1000.0));
+        assert_eq!(merged.cost_origin.as_deref(), Some("BOOTSTRAP"));
+    }
+
+    #[test]
+    fn withdrawing_more_than_cost_clamps_at_zero() {
+        let mut r = pocket(100.0);
+        apply_reserve_flows(&mut r, &[], "2026-09-21");
+        apply_reserve_flows(
+            &mut r,
+            &[flow_tx("big", false, 500.0, "2026-09-22T00:00:00.000Z")],
+            "2026-09-22",
+        );
+        assert_eq!(r.cost_basis, Some(0.0));
+    }
+
+    #[test]
+    fn incomplete_flow_trail_is_flagged_unreliable() {
+        // Withdrawals exceed contributions on a day before any yield could exist: impossible,
+        // so the trail must not be trusted as principal (matches both real Caixinhas).
+        let mut r = pocket(4881.22);
+        let txs = vec![
+            flow_tx("i", true, 1000.0, "2026-02-11T00:00:00.000Z"),
+            flow_tx("o", false, 1184.81, "2026-02-12T00:00:00.000Z"),
+        ];
+        apply_reserve_flows(&mut r, &txs, "2026-09-21");
+        let rec = r.reconstruction.unwrap();
+        assert!(!rec.reliable);
+        assert!(rec.min_running_principal < 0.0);
+        assert_eq!(r.cost_origin.as_deref(), Some("BOOTSTRAP")); // fell back, did not use net flows
+        assert_eq!(r.cost_basis, Some(4881.22));
     }
 }
