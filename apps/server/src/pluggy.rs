@@ -87,6 +87,15 @@ pub struct PluggyAccount {
     pub number: Option<String>,
     pub balance: Option<f64>,
     pub currency_code: Option<String>,
+    pub credit_data: Option<PluggyCreditData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyCreditData {
+    pub credit_limit: Option<f64>,
+    pub available_credit_limit: Option<f64>,
+    pub balance_due_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +124,10 @@ struct PluggyInvestment {
     balance: Option<f64>,
     quantity: Option<f64>,
     currency_code: Option<String>,
+    status: Option<String>,
+    amount_original: Option<f64>,
+    due_date: Option<String>,
+    issuer: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +165,13 @@ pub struct AccountState {
     /// Read-only comparison of the Pluggy balance with Wealthfolio's cash; never auto-corrected.
     #[serde(default)]
     pub balance_check: Option<BalanceCheck>,
+    /// Credit-card details, recorded for review only (cards are not imported yet).
+    #[serde(default)]
+    pub credit_limit: Option<f64>,
+    #[serde(default)]
+    pub available_credit: Option<f64>,
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -192,6 +212,16 @@ pub struct InvestmentState {
     pub balance: Option<f64>,
     pub quantity: Option<f64>,
     pub currency: Option<String>,
+    /// ACTIVE | TOTAL_WITHDRAWAL | PENDING; only ACTIVE positions are written.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Original invested amount (cost); recorded for review, not yet used as cost basis.
+    #[serde(default)]
+    pub amount_original: Option<f64>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -274,6 +304,21 @@ pub fn match_candidates(
         .filter(|a| !a.is_archived && names.contains(&norm(&a.name)))
         .map(|a| a.id.clone())
         .collect()
+}
+
+/// MeuPluggy proxies every bank through one connector, so the connector name says
+/// nothing about the institution; label the item after its first account instead.
+pub fn derive_institution(connector: Option<&str>, accounts: &[PluggyAccount]) -> Option<String> {
+    let name_of = |a: &PluggyAccount| a.marketing_name.clone().or_else(|| a.name.clone());
+    match connector {
+        Some(c) if c.eq_ignore_ascii_case("MeuPluggy") => accounts
+            .iter()
+            .find(|a| a.kind == "BANK")
+            .or_else(|| accounts.first())
+            .and_then(name_of)
+            .map(|n| format!("MeuPluggy · {n}")),
+        other => other.map(str::to_string),
+    }
 }
 
 /// Maps a Pluggy bank transaction to a Wealthfolio cash activity.
@@ -370,6 +415,9 @@ pub fn asset_id_for_investment(investment_id: &str) -> String {
 /// namespaced (`PLUGGY-<id>`) so it can never collide with a real ticker, and the
 /// cost basis equals current value because Pluggy exposes no reliable cost.
 pub fn map_investment(i: &InvestmentState) -> Option<ManualHoldingInput> {
+    if i.status.as_deref().is_some_and(|s| s != "ACTIVE") {
+        return None; // redeemed (TOTAL_WITHDRAWAL) or pending positions are not holdings
+    }
     let balance = Decimal::from_f64_retain(i.balance?)?.round_dp(2);
     if balance <= Decimal::ZERO {
         return None;
@@ -543,7 +591,11 @@ async fn sync_inner(
     // 1. Discover accounts + investments (read-only).
     let mut investments = Vec::new();
     for item_id in &cfg.item_ids {
-        let institution = client.institution(item_id).await;
+        let connector = client.institution(item_id).await;
+        let accounts: Vec<PluggyAccount> = client
+            .paged("/accounts", &[("itemId", item_id.clone())])
+            .await?;
+        let institution = derive_institution(connector.as_deref(), &accounts);
         let link = st.items.entry(item_id.clone()).or_insert_with(|| ItemLink {
             item_id: item_id.clone(),
             institution: None,
@@ -555,9 +607,6 @@ async fn sync_inner(
             last_error: None,
         });
         link.institution = institution.clone();
-        let accounts: Vec<PluggyAccount> = client
-            .paged("/accounts", &[("itemId", item_id.clone())])
-            .await?;
         for p in accounts {
             let candidates = match_candidates(&p, institution.as_deref(), &existing);
             let entry = st
@@ -580,8 +629,21 @@ async fn sync_inner(
                     last_synced_at: None,
                     last_error: None,
                     balance_check: None,
+                    credit_limit: None,
+                    available_credit: None,
+                    due_date: None,
                 });
             entry.institution = institution.clone();
+            entry.credit_limit = p.credit_data.as_ref().and_then(|c| c.credit_limit);
+            entry.available_credit = p
+                .credit_data
+                .as_ref()
+                .and_then(|c| c.available_credit_limit);
+            entry.due_date = p
+                .credit_data
+                .as_ref()
+                .and_then(|c| c.balance_due_date.clone())
+                .map(|d| d.chars().take(10).collect());
             entry.name = p
                 .marketing_name
                 .clone()
@@ -608,6 +670,10 @@ async fn sync_inner(
                 balance: i.balance,
                 quantity: i.quantity,
                 currency: i.currency_code,
+                status: i.status,
+                amount_original: i.amount_original,
+                due_date: i.due_date.map(|d| d.chars().take(10).collect()),
+                issuer: i.issuer,
             })),
             Err(e) => {
                 warn!("Pluggy investments unavailable for an item: {e}");
@@ -999,7 +1065,54 @@ mod tests {
             balance,
             quantity: qty,
             currency: Some("BRL".into()),
+            status: Some("ACTIVE".into()),
+            amount_original: None,
+            due_date: None,
+            issuer: None,
         }
+    }
+
+    #[test]
+    fn redeemed_investments_are_not_holdings() {
+        for status in ["TOTAL_WITHDRAWAL", "PENDING"] {
+            let mut i = inv("x", Some(100.0), Some(1.0));
+            i.status = Some(status.into());
+            assert!(map_investment(&i).is_none());
+        }
+        let mut legacy = inv("x", Some(100.0), Some(1.0));
+        legacy.status = None; // state written before this field existed
+        assert!(map_investment(&legacy).is_some());
+    }
+
+    fn acct(kind: &str, name: &str) -> PluggyAccount {
+        PluggyAccount {
+            id: "a".into(),
+            kind: kind.into(),
+            subtype: None,
+            name: Some(name.into()),
+            marketing_name: None,
+            number: None,
+            balance: None,
+            currency_code: None,
+            credit_data: None,
+        }
+    }
+
+    #[test]
+    fn meupluggy_items_are_labelled_by_their_bank_account() {
+        let accounts = vec![
+            acct("CREDIT", "MASTERCARD LIVRE"),
+            acct("BANK", "BANCO BV S.A."),
+        ];
+        assert_eq!(
+            derive_institution(Some("MeuPluggy"), &accounts).as_deref(),
+            Some("MeuPluggy · BANCO BV S.A.")
+        );
+        assert_eq!(
+            derive_institution(Some("Pluggy Bank"), &accounts).as_deref(),
+            Some("Pluggy Bank")
+        );
+        assert_eq!(derive_institution(None, &accounts), None);
     }
 
     #[test]
