@@ -33,9 +33,25 @@ item to an existing **HOLDINGS-mode** Wealthfolio account. Each sync then writes
 
 - one manual-priced custom asset per Pluggy investment, symbol `PLUGGY-<id8>` (never a real ticker),
   deterministic asset id, so re-syncs reuse the asset;
-- quantity from Pluggy (or 1 unit of full value if quantity is 0/missing), price = balance / quantity;
-- cost basis = current value (Pluggy has no reliable cost), so no unrealized gain is shown;
-- an empty result never writes a snapshot.
+- only `ACTIVE` positions; `TOTAL_WITHDRAWAL` (redeemed) and pending ones are skipped;
+- quantity from Pluggy (or 1 unit if 0/missing); **market value and cost are separate**: the day's manual
+  quote is the unit price (`ManualHoldingInput.unit_price`), the cost basis is Pluggy's `amountOriginal`;
+- market value basis: `PLUGGY_VALUE_BASIS=gross` (default, Pluggy `amount`) or `net` (Pluggy `balance`).
+  Pluggy's `balance` is net of IR/IOF (`amount - taxes - taxes2`); existing manual balances track gross;
+- the item's BANK account balances are written as cash in the same snapshot; snapshots carry no net
+  contribution and create no activities, so this is flow-neutral and adds no transaction history;
+- an empty result (no positions and no cash) never writes a snapshot.
+
+## Credit cards
+
+Link a Pluggy `CREDIT` account to a `CREDIT_CARD` Wealthfolio account (enforced at link time).
+- HOLDINGS mode (default recommendation): each sync writes the card debt as negative cash (liability).
+- TRANSACTIONS mode: posted charges (`DEBIT` with positive amount) -> `WITHDRAWAL`, payments/refunds
+  (`CREDIT` with negative amount) -> `DEPOSIT`; pending and sign-inconsistent rows are skipped.
+- Limit, available credit, due date and the latest 12 bills are recorded in `/status` for review.
+
+Bank accounts are not imported as transactions unless linked to a TRANSACTIONS-mode account; the
+default for balance-focused accounts is the item snapshot above (no ledger noise, no backfill).
 
 ## Balance reconciliation
 
@@ -46,5 +62,5 @@ asynchronously, so a fresh import may read `DRIFT`/`UNKNOWN` until the next sync
 ## Limits
 
 - Linked account must be in TRANSACTIONS tracking mode, else it is skipped with `lastError`.
-- Credit cards/invoices are not imported.
+- Investment transactions (aporte/resgate history) are available from Pluggy but not consumed.
 - Existing accounts/activities are never modified by the sync.

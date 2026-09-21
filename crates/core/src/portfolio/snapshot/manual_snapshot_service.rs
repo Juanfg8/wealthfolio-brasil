@@ -25,6 +25,9 @@ pub struct ManualHoldingInput {
     pub quantity: Decimal,
     pub currency: String,
     pub average_cost: Decimal,
+    /// Current unit price for MANUAL-priced assets. When set, the day's manual quote
+    /// uses it instead of `average_cost`, so cost basis and market value stay separate.
+    pub unit_price: Option<Decimal>,
     /// Asset name for custom assets
     pub name: Option<String>,
     /// Data source (e.g., "MANUAL") — when "MANUAL", quote mode is set to manual
@@ -166,11 +169,12 @@ impl ManualSnapshotService {
             // quotes for the snapshot date.
             let is_manual_mode = asset.quote_mode == QuoteMode::Manual
                 || matches!(quote_mode.as_deref(), Some(DATA_SOURCE_MANUAL));
-            if is_manual_mode && !holding.average_cost.is_zero() {
+            let quote_price = holding.unit_price.unwrap_or(holding.average_cost);
+            if is_manual_mode && !quote_price.is_zero() {
                 let source = DATA_SOURCE_MANUAL.to_string();
                 self.create_quote_from_snapshot(
                     &asset.id,
-                    holding.average_cost,
+                    quote_price,
                     &holding.currency,
                     request.snapshot_date,
                     source,

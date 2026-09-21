@@ -22,7 +22,8 @@ use wealthfolio_core::{
     accounts::{Account, AccountServiceTrait, TrackingMode},
     activities::{ActivityBulkMutationRequest, NewActivity},
     portfolio::snapshot::{
-        ManualHoldingInput, ManualSnapshotRequest, ManualSnapshotService, SnapshotSource,
+        CashBalanceInput, ManualHoldingInput, ManualSnapshotRequest, ManualSnapshotService,
+        SnapshotSource,
     },
     utils::time_utils::{parse_user_timezone_or_default, user_today},
 };
@@ -110,6 +111,23 @@ pub struct PluggyTransaction {
     pub status: Option<String>,
     pub category: Option<String>,
     pub currency_code: Option<String>,
+    pub credit_card_metadata: Option<PluggyCardMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluggyCardMeta {
+    pub bill_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluggyBill {
+    id: String,
+    due_date: Option<String>,
+    bill_closing_date: Option<String>,
+    total_amount: Option<f64>,
+    minimum_payment_amount: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +146,13 @@ struct PluggyInvestment {
     amount_original: Option<f64>,
     due_date: Option<String>,
     issuer: Option<String>,
+    /// Gross current value; `balance` is net of IR/IOF (`amount - taxes - taxes2`).
+    amount: Option<f64>,
+    taxes: Option<f64>,
+    taxes2: Option<f64>,
+    rate: Option<f64>,
+    rate_type: Option<String>,
+    fixed_annual_rate: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +197,19 @@ pub struct AccountState {
     pub available_credit: Option<f64>,
     #[serde(default)]
     pub due_date: Option<String>,
+    /// Latest card invoices (most recent first), recorded for review.
+    #[serde(default)]
+    pub bills: Vec<BillState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillState {
+    pub id: String,
+    pub due_date: Option<String>,
+    pub closing_date: Option<String>,
+    pub total_amount: Option<f64>,
+    pub minimum_payment: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +233,9 @@ pub struct ItemLink {
     pub status: LinkStatus,
     pub linked_account_id: Option<String>,
     pub positions_written: usize,
+    /// Existing Wealthfolio account ids that look like this institution (never auto-applied).
+    #[serde(default)]
+    pub candidates: Vec<String>,
     pub total_value: Option<f64>,
     pub last_synced_at: Option<String>,
     pub last_error: Option<String>,
@@ -222,6 +263,19 @@ pub struct InvestmentState {
     pub due_date: Option<String>,
     #[serde(default)]
     pub issuer: Option<String>,
+    /// Gross current value (before IR/IOF). `balance` is the net value used as market value.
+    #[serde(default)]
+    pub gross_amount: Option<f64>,
+    /// IR + IOF withheld, so `gross_amount - taxes == balance`.
+    #[serde(default)]
+    pub taxes: Option<f64>,
+    /// Contracted rate (e.g. 120 = 120% of CDI when `rate_type` is CDI).
+    #[serde(default)]
+    pub rate: Option<f64>,
+    #[serde(default)]
+    pub rate_type: Option<String>,
+    #[serde(default)]
+    pub fixed_annual_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -283,27 +337,42 @@ fn norm(s: &str) -> String {
         .collect()
 }
 
-/// Existing accounts that plausibly correspond to a Pluggy account. Exact
-/// normalized-name match only; the result is a suggestion for review.
+fn tokens(s: &str) -> HashSet<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().flat_map(|c| c.to_lowercase()).collect())
+        .collect()
+}
+
+/// Existing accounts that plausibly correspond to Pluggy names (institution and
+/// account names). A match is either an equal normalized name, or every token of
+/// the Wealthfolio account name appearing among the Pluggy tokens ("BTG" in
+/// "BTG Investimentos"). Suggestions only; nothing is applied automatically.
+pub fn match_names(pluggy_names: &[&str], existing: &[Account]) -> Vec<String> {
+    let exact: Vec<String> = pluggy_names.iter().map(|n| norm(n)).collect();
+    let pool: HashSet<String> = pluggy_names.iter().flat_map(|n| tokens(n)).collect();
+    existing
+        .iter()
+        .filter(|a| !a.is_archived)
+        .filter(|a| {
+            let t = tokens(&a.name);
+            exact.contains(&norm(&a.name)) || (!t.is_empty() && t.is_subset(&pool))
+        })
+        .map(|a| a.id.clone())
+        .collect()
+}
+
 pub fn match_candidates(
     p: &PluggyAccount,
     institution: Option<&str>,
     existing: &[Account],
 ) -> Vec<String> {
-    let mut names: Vec<String> = [p.name.as_deref(), p.marketing_name.as_deref()]
+    let mut names: Vec<&str> = [p.name.as_deref(), p.marketing_name.as_deref(), institution]
         .into_iter()
         .flatten()
-        .map(norm)
-        .filter(|n| !n.is_empty())
         .collect();
-    if let (Some(inst), Some(n)) = (institution, p.name.as_deref()) {
-        names.push(norm(&format!("{inst}{n}")));
-    }
-    existing
-        .iter()
-        .filter(|a| !a.is_archived && names.contains(&norm(&a.name)))
-        .map(|a| a.id.clone())
-        .collect()
+    names.dedup();
+    match_names(&names, existing)
 }
 
 /// MeuPluggy proxies every bank through one connector, so the connector name says
@@ -330,17 +399,61 @@ pub fn map_transaction(
     since: Option<&str>,
     tx: &PluggyTransaction,
 ) -> Option<NewActivity> {
+    let activity_type = match tx.kind.as_str() {
+        "CREDIT" => "DEPOSIT",
+        "DEBIT" => "WITHDRAWAL",
+        _ => return None,
+    };
+    cash_activity(
+        pluggy_account_id,
+        wf_account_id,
+        account_currency,
+        since,
+        tx,
+        activity_type,
+    )
+}
+
+/// Maps a credit-card transaction using the semantics observed on real MeuPluggy
+/// data: a charge is `DEBIT` with a positive amount, a payment/refund is `CREDIT`
+/// with a negative amount. Anything inconsistent is skipped rather than guessed.
+/// On a liability account a charge lowers cash (more debt) and a payment raises it.
+pub fn map_card_transaction(
+    pluggy_account_id: &str,
+    wf_account_id: &str,
+    account_currency: &str,
+    since: Option<&str>,
+    tx: &PluggyTransaction,
+) -> Option<NewActivity> {
+    let activity_type = match (tx.kind.as_str(), tx.amount) {
+        ("DEBIT", a) if a > 0.0 => "WITHDRAWAL",
+        ("CREDIT", a) if a < 0.0 => "DEPOSIT",
+        _ => return None,
+    };
+    cash_activity(
+        pluggy_account_id,
+        wf_account_id,
+        account_currency,
+        since,
+        tx,
+        activity_type,
+    )
+}
+
+fn cash_activity(
+    pluggy_account_id: &str,
+    wf_account_id: &str,
+    account_currency: &str,
+    since: Option<&str>,
+    tx: &PluggyTransaction,
+    activity_type: &str,
+) -> Option<NewActivity> {
     if tx.status.as_deref().is_some_and(|s| s != "POSTED") {
         return None; // pending transactions can change/disappear
     }
     if since.is_some_and(|s| tx.date.get(..10).unwrap_or("") < s) {
         return None;
     }
-    let activity_type = match tx.kind.as_str() {
-        "CREDIT" => "DEPOSIT",
-        "DEBIT" => "WITHDRAWAL",
-        _ => return None,
-    };
     let amount = Decimal::from_f64_retain(tx.amount.abs())?.round_dp(2);
     if amount.is_zero() {
         return None;
@@ -348,6 +461,7 @@ pub fn map_transaction(
     let meta = serde_json::json!({
         "pluggyAccountId": pluggy_account_id,
         "category": tx.category,
+        "billId": tx.credit_card_metadata.as_ref().and_then(|m| m.bill_id.clone()),
     });
     Some(NewActivity {
         id: None,
@@ -411,14 +525,41 @@ pub fn asset_id_for_investment(investment_id: &str) -> String {
     uuid::Uuid::from_bytes(b).to_string()
 }
 
+/// Which Pluggy value becomes a position's market value. Pluggy's `amount` is
+/// gross; `balance` is net of IR/IOF. Existing manual balances track gross
+/// (BTG/BV within 0.2% of gross vs up to 1.3% of net), so gross is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueBasis {
+    Gross,
+    Net,
+}
+
+impl ValueBasis {
+    pub fn from_env() -> Self {
+        match std::env::var("PLUGGY_VALUE_BASIS")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("net") => Self::Net,
+            _ => Self::Gross,
+        }
+    }
+}
+
 /// Maps a Pluggy investment to a manual-priced custom position. The symbol is
-/// namespaced (`PLUGGY-<id>`) so it can never collide with a real ticker, and the
-/// cost basis equals current value because Pluggy exposes no reliable cost.
-pub fn map_investment(i: &InvestmentState) -> Option<ManualHoldingInput> {
+/// namespaced (`PLUGGY-<id>`) so it can never collide with a real ticker. Market value
+/// (per `basis`) and cost basis (Pluggy's original amount) are kept separate.
+pub fn map_investment(i: &InvestmentState, basis: ValueBasis) -> Option<ManualHoldingInput> {
     if i.status.as_deref().is_some_and(|s| s != "ACTIVE") {
         return None; // redeemed (TOTAL_WITHDRAWAL) or pending positions are not holdings
     }
-    let balance = Decimal::from_f64_retain(i.balance?)?.round_dp(2);
+    // Net = Pluggy's `balance`; gross = `amount` (falls back to `balance` when absent).
+    let value = match basis {
+        ValueBasis::Gross => i.gross_amount.filter(|g| *g > 0.0).or(i.balance),
+        ValueBasis::Net => i.balance,
+    };
+    let balance = Decimal::from_f64_retain(value?)?.round_dp(2);
     if balance <= Decimal::ZERO {
         return None;
     }
@@ -427,6 +568,14 @@ pub fn map_investment(i: &InvestmentState) -> Option<ManualHoldingInput> {
         .and_then(Decimal::from_f64_retain)
         .filter(|q| *q > Decimal::ZERO)
         .unwrap_or(Decimal::ONE);
+    let unit_price = (balance / quantity).round_dp(10);
+    // Cost basis is the original invested amount when Pluggy provides it.
+    let average_cost = i
+        .amount_original
+        .and_then(Decimal::from_f64_retain)
+        .filter(|c| *c > Decimal::ZERO)
+        .map(|c| (c / quantity).round_dp(10))
+        .unwrap_or(unit_price);
     let currency = i.currency.clone().unwrap_or_else(|| "BRL".into());
     let short: String =
         i.id.chars()
@@ -445,7 +594,8 @@ pub fn map_investment(i: &InvestmentState) -> Option<ManualHoldingInput> {
         exchange_mic: None,
         quantity,
         currency: currency.clone(),
-        average_cost: (balance / quantity).round_dp(6),
+        average_cost,
+        unit_price: Some(unit_price),
         name: Some(name),
         data_source: Some("MANUAL".into()),
         asset_kind: Some("INVESTMENT".into()),
@@ -602,11 +752,19 @@ async fn sync_inner(
             status: LinkStatus::NeedsReview,
             linked_account_id: None,
             positions_written: 0,
+            candidates: vec![],
             total_value: None,
             last_synced_at: None,
             last_error: None,
         });
         link.institution = institution.clone();
+        let mut names: Vec<&str> = institution.iter().map(String::as_str).collect();
+        names.extend(
+            accounts
+                .iter()
+                .filter_map(|a| a.marketing_name.as_deref().or(a.name.as_deref())),
+        );
+        link.candidates = match_names(&names, &existing);
         for p in accounts {
             let candidates = match_candidates(&p, institution.as_deref(), &existing);
             let entry = st
@@ -632,6 +790,7 @@ async fn sync_inner(
                     credit_limit: None,
                     available_credit: None,
                     due_date: None,
+                    bills: vec![],
                 });
             entry.institution = institution.clone();
             entry.credit_limit = p.credit_data.as_ref().and_then(|c| c.credit_limit);
@@ -644,6 +803,25 @@ async fn sync_inner(
                 .as_ref()
                 .and_then(|c| c.balance_due_date.clone())
                 .map(|d| d.chars().take(10).collect());
+            if p.kind == "CREDIT" {
+                if let Ok(mut bills) = client
+                    .paged::<PluggyBill>("/bills", &[("accountId", p.id.clone())])
+                    .await
+                {
+                    bills.sort_by(|x, y| y.due_date.cmp(&x.due_date));
+                    entry.bills = bills
+                        .into_iter()
+                        .take(12)
+                        .map(|b| BillState {
+                            id: b.id,
+                            due_date: b.due_date.map(|d| d.chars().take(10).collect()),
+                            closing_date: b.bill_closing_date.map(|d| d.chars().take(10).collect()),
+                            total_amount: b.total_amount,
+                            minimum_payment: b.minimum_payment_amount,
+                        })
+                        .collect();
+                }
+            }
             entry.name = p
                 .marketing_name
                 .clone()
@@ -670,6 +848,14 @@ async fn sync_inner(
                 balance: i.balance,
                 quantity: i.quantity,
                 currency: i.currency_code,
+                gross_amount: i.amount,
+                taxes: match (i.taxes, i.taxes2) {
+                    (None, None) => None,
+                    (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                },
+                rate: i.rate,
+                rate_type: i.rate_type,
+                fixed_annual_rate: i.fixed_annual_rate,
                 status: i.status,
                 amount_original: i.amount_original,
                 due_date: i.due_date.map(|d| d.chars().take(10).collect()),
@@ -691,16 +877,21 @@ async fn sync_inner(
         .filter(|a| a.status == LinkStatus::NeedsReview)
         .count();
 
-    // 2. Transactions for explicitly linked bank accounts only.
+    let timezone = state.timezone.read().unwrap().clone();
+    let today = user_today(parse_user_timezone_or_default(&timezone));
+    let base_currency = state.base_currency.read().unwrap().clone();
+    let basis = ValueBasis::from_env();
+
+    // 2. Linked accounts: bank transactions, or card balance / transactions.
     for acc in st
         .accounts
         .values_mut()
         .filter(|a| a.status == LinkStatus::Linked)
     {
         acc.last_error = None;
-        if acc.kind != "BANK" {
-            acc.last_error =
-                Some("only BANK accounts are synced (credit cards not implemented)".into());
+        let is_card = acc.kind == "CREDIT";
+        if acc.kind != "BANK" && !is_card {
+            acc.last_error = Some(format!("unsupported account kind {}", acc.kind));
             continue;
         }
         let Some(wf_id) = acc.linked_account_id.clone() else {
@@ -713,10 +904,46 @@ async fn sync_inner(
                 continue;
             }
         };
-        if wf.tracking_mode != TrackingMode::Transactions {
-            acc.last_error =
-                Some("linked account is not in TRANSACTIONS tracking mode; skipped".into());
+        if is_card != (wf.account_type == "CREDIT_CARD") {
+            acc.last_error = Some(
+                "credit cards link to CREDIT_CARD accounts and bank accounts to non-card accounts"
+                    .into(),
+            );
             continue;
+        }
+        match wf.tracking_mode {
+            TrackingMode::Holdings if is_card => {
+                // Balance-only: a card's debt is negative cash on a liability account.
+                let Some(owed) = acc.balance else {
+                    acc.last_error = Some("Pluggy returned no card balance; skipped".into());
+                    continue;
+                };
+                let cash = vec![CashBalanceInput {
+                    currency: acc.currency.clone(),
+                    amount: Decimal::from_f64_retain(-owed)
+                        .unwrap_or_default()
+                        .round_dp(2),
+                }];
+                match write_snapshot(state, &wf, vec![], cash, today, &timezone, &base_currency)
+                    .await
+                {
+                    Ok(()) => acc.last_synced_at = Some(Utc::now().to_rfc3339()),
+                    Err(e) => acc.last_error = Some(format!("snapshot write failed: {e}")),
+                }
+                continue;
+            }
+            TrackingMode::Transactions => {}
+            _ => {
+                acc.last_error = Some(
+                    if is_card {
+                        "linked card account must be HOLDINGS (balance) or TRANSACTIONS mode"
+                    } else {
+                        "bank accounts import transactions only in TRANSACTIONS mode; use the item link for a balance snapshot"
+                    }
+                    .into(),
+                );
+                continue;
+            }
         }
         let mut q = vec![("accountId", acc.id.clone())];
         if let Some(since) = &acc.since {
@@ -730,9 +957,14 @@ async fn sync_inner(
             }
         };
         summary.transactions_seen += txs.len();
+        let mapper = if is_card {
+            map_card_transaction
+        } else {
+            map_transaction
+        };
         let mapped: Vec<NewActivity> = txs
             .iter()
-            .filter_map(|t| map_transaction(&acc.id, &wf_id, &wf.currency, acc.since.as_deref(), t))
+            .filter_map(|t| mapper(&acc.id, &wf_id, &wf.currency, acc.since.as_deref(), t))
             .collect();
         let keys: Vec<String> = mapped
             .iter()
@@ -763,13 +995,17 @@ async fn sync_inner(
             .ok()
             .and_then(|v| v.into_iter().next())
             .and_then(|v| v.cash_balance.to_string().parse::<f64>().ok());
-        acc.balance_check = Some(reconcile_balance(acc.balance, wf_cash));
+        let expected = if is_card {
+            acc.balance.map(|b| -b)
+        } else {
+            acc.balance
+        };
+        acc.balance_check = Some(reconcile_balance(expected, wf_cash));
     }
 
-    // 3. Investments for explicitly linked items -> snapshot on a HOLDINGS-mode account.
-    let timezone = state.timezone.read().unwrap().clone();
-    let today = user_today(parse_user_timezone_or_default(&timezone));
-    let base_currency = state.base_currency.read().unwrap().clone();
+    // 3. Linked items -> one snapshot (active positions + the item's bank cash) on a
+    //    HOLDINGS-mode account. Snapshots carry no net contribution, so this is
+    //    flow-neutral and adds no transaction history.
     for link in st
         .items
         .values_mut()
@@ -794,43 +1030,50 @@ async fn sync_inner(
             .investments
             .iter()
             .filter(|i| i.item_id == link.item_id)
-            .filter_map(map_investment)
+            .filter_map(|i| map_investment(i, basis))
             .collect();
+        let mut cash: BTreeMap<String, Decimal> = BTreeMap::new();
+        for a in st
+            .accounts
+            .values()
+            .filter(|a| a.item_id == link.item_id && a.kind == "BANK")
+        {
+            if let Some(b) = a.balance {
+                *cash.entry(a.currency.clone()).or_default() +=
+                    Decimal::from_f64_retain(b).unwrap_or_default().round_dp(2);
+            }
+        }
         // Never write an empty snapshot: it would zero out the account.
-        if positions.is_empty() {
-            link.last_error = Some("no Pluggy positions returned; snapshot not written".into());
+        if positions.is_empty() && cash.values().all(|c| c.is_zero()) {
+            link.last_error =
+                Some("no Pluggy positions or cash returned; snapshot not written".into());
             continue;
         }
-        let total: f64 = st
-            .investments
+        let total: Decimal = positions
             .iter()
-            .filter(|i| i.item_id == link.item_id)
-            .filter_map(|i| i.balance)
-            .filter(|b| *b > 0.0)
-            .sum();
+            .map(|p| p.quantity * p.unit_price.unwrap_or(p.average_cost))
+            .sum::<Decimal>()
+            + cash.values().copied().sum::<Decimal>();
         let n = positions.len();
-        let saved = ManualSnapshotService::new(
-            state.asset_service.clone(),
-            state.fx_service.clone(),
-            state.snapshot_service.clone(),
-            state.quote_service.clone(),
-        )
-        .with_timezone(timezone.clone())
-        .save_manual_snapshot(ManualSnapshotRequest {
-            account_id: wf_id.clone(),
-            account_currency: wf.currency.clone(),
-            snapshot_date: today,
+        let cash_inputs = cash
+            .into_iter()
+            .map(|(currency, amount)| CashBalanceInput { currency, amount })
+            .collect();
+        match write_snapshot(
+            state,
+            &wf,
             positions,
-            cash_balances: vec![],
-            base_currency: Some(base_currency.clone()),
-            source: SnapshotSource::ManualEntry,
-        })
-        .await;
-        match saved {
-            Ok(_) => {
+            cash_inputs,
+            today,
+            &timezone,
+            &base_currency,
+        )
+        .await
+        {
+            Ok(()) => {
                 link.last_error = None;
                 link.positions_written = n;
-                link.total_value = Some(total);
+                link.total_value = total.round_dp(2).to_string().parse::<f64>().ok();
                 link.last_synced_at = Some(Utc::now().to_rfc3339());
                 summary.investment_positions_written += n;
             }
@@ -841,6 +1084,35 @@ async fn sync_inner(
         "Pluggy sync: {} accounts, {} activities created, {} already present",
         summary.accounts_seen, summary.activities_created, summary.activities_skipped_existing
     );
+    Ok(())
+}
+
+async fn write_snapshot(
+    state: &Arc<AppState>,
+    wf: &Account,
+    positions: Vec<ManualHoldingInput>,
+    cash_balances: Vec<CashBalanceInput>,
+    today: chrono::NaiveDate,
+    timezone: &str,
+    base_currency: &str,
+) -> Result<()> {
+    ManualSnapshotService::new(
+        state.asset_service.clone(),
+        state.fx_service.clone(),
+        state.snapshot_service.clone(),
+        state.quote_service.clone(),
+    )
+    .with_timezone(timezone.to_string())
+    .save_manual_snapshot(ManualSnapshotRequest {
+        account_id: wf.id.clone(),
+        account_currency: wf.currency.clone(),
+        snapshot_date: today,
+        positions,
+        cash_balances,
+        base_currency: Some(base_currency.to_string()),
+        source: SnapshotSource::ManualEntry,
+    })
+    .await?;
     Ok(())
 }
 
@@ -859,7 +1131,10 @@ pub fn apply_link(
 ) -> Result<AccountState> {
     let mut st = load_state(&state.data_root);
     if let Some(wf_id) = account_id {
-        state.account_service.get_account(wf_id)?; // must exist
+        let wf = state.account_service.get_account(wf_id)?; // must exist
+        if let Some(p) = st.accounts.get(pluggy_account_id) {
+            check_link_compat(&p.kind, &wf.account_type)?;
+        }
         if st
             .accounts
             .values()
@@ -888,6 +1163,15 @@ pub fn apply_link(
     let out = acc.clone();
     save_state(&state.data_root, &st)?;
     Ok(out)
+}
+
+/// Cards link to CREDIT_CARD accounts and bank accounts to any other account type.
+pub fn check_link_compat(pluggy_kind: &str, wf_account_type: &str) -> Result<()> {
+    match (pluggy_kind == "CREDIT", wf_account_type == "CREDIT_CARD") {
+        (true, false) => bail!("a Pluggy credit card must link to a CREDIT_CARD account"),
+        (false, true) => bail!("a Pluggy bank account cannot link to a CREDIT_CARD account"),
+        _ => Ok(()),
+    }
 }
 
 /// Explicit user decision for a Pluggy item's investments: link to an existing
@@ -970,6 +1254,7 @@ mod tests {
             status: status.map(Into::into),
             category: None,
             currency_code: Some("BRL".into()),
+            credit_card_metadata: None,
         }
     }
 
@@ -1054,6 +1339,10 @@ mod tests {
         assert_eq!(skipped, 3);
     }
 
+    fn map_net(i: &InvestmentState) -> Option<ManualHoldingInput> {
+        map_investment(i, ValueBasis::Net)
+    }
+
     fn inv(id: &str, balance: Option<f64>, qty: Option<f64>) -> InvestmentState {
         InvestmentState {
             id: id.into(),
@@ -1069,6 +1358,11 @@ mod tests {
             amount_original: None,
             due_date: None,
             issuer: None,
+            gross_amount: None,
+            taxes: None,
+            rate: None,
+            rate_type: None,
+            fixed_annual_rate: None,
         }
     }
 
@@ -1077,11 +1371,11 @@ mod tests {
         for status in ["TOTAL_WITHDRAWAL", "PENDING"] {
             let mut i = inv("x", Some(100.0), Some(1.0));
             i.status = Some(status.into());
-            assert!(map_investment(&i).is_none());
+            assert!(map_net(&i).is_none());
         }
         let mut legacy = inv("x", Some(100.0), Some(1.0));
         legacy.status = None; // state written before this field existed
-        assert!(map_investment(&legacy).is_some());
+        assert!(map_net(&legacy).is_some());
     }
 
     fn acct(kind: &str, name: &str) -> PluggyAccount {
@@ -1125,7 +1419,7 @@ mod tests {
 
     #[test]
     fn maps_investments_with_namespaced_symbol_and_unit_price() {
-        let h = map_investment(&inv("9df10577-9b13", Some(1359.39), Some(3.0))).unwrap();
+        let h = map_net(&inv("9df10577-9b13", Some(1359.39), Some(3.0))).unwrap();
         assert_eq!(h.symbol, "PLUGGY-9DF10577");
         assert_eq!(h.quantity, Decimal::from(3));
         assert_eq!(h.average_cost, Decimal::new(45313, 2)); // 1359.39 / 3
@@ -1136,7 +1430,7 @@ mod tests {
     #[test]
     fn zero_or_missing_quantity_falls_back_to_one_unit_of_full_value() {
         for q in [None, Some(0.0)] {
-            let h = map_investment(&inv("x1", Some(118.4), q)).unwrap();
+            let h = map_net(&inv("x1", Some(118.4), q)).unwrap();
             assert_eq!(h.quantity, Decimal::ONE);
             assert_eq!(h.average_cost, Decimal::new(11840, 2));
         }
@@ -1144,9 +1438,9 @@ mod tests {
 
     #[test]
     fn skips_investments_without_positive_balance() {
-        assert!(map_investment(&inv("x", None, Some(1.0))).is_none());
-        assert!(map_investment(&inv("x", Some(0.0), Some(1.0))).is_none());
-        assert!(map_investment(&inv("x", Some(-5.0), Some(1.0))).is_none());
+        assert!(map_net(&inv("x", None, Some(1.0))).is_none());
+        assert!(map_net(&inv("x", Some(0.0), Some(1.0))).is_none());
+        assert!(map_net(&inv("x", Some(-5.0), Some(1.0))).is_none());
     }
 
     #[test]
@@ -1160,5 +1454,155 @@ mod tests {
     #[test]
     fn normalizes_names_for_candidates() {
         assert_eq!(norm("Nu Pagamentos - Conta"), norm("nu pagamentos conta"));
+    }
+    #[test]
+    fn real_cdb_separates_net_value_from_cost_basis() {
+        // Shape observed on a real 120% CDI CDB (rounded): gross 10637.69, IR 143.48,
+        // net balance 10494.21, principal 10000, quantity 1,000,000 units.
+        let mut i = inv("cdb", Some(10494.21), Some(1_000_000.0));
+        i.amount_original = Some(10000.0);
+        i.gross_amount = Some(10637.69);
+        i.taxes = Some(143.48);
+        let h = map_net(&i).unwrap();
+        let q = h.quantity;
+        assert_eq!(q * h.unit_price.unwrap(), Decimal::new(1049421, 2)); // market value = net
+        assert_eq!(q * h.average_cost, Decimal::from(10000)); // cost = principal
+                                                              // Gross basis values the same position at the gross amount; cost is unchanged.
+        let g = map_investment(&i, ValueBasis::Gross).unwrap();
+        assert_eq!(q * g.unit_price.unwrap(), Decimal::new(1063769, 2));
+        assert_eq!(q * g.average_cost, Decimal::from(10000));
+        // Pluggy's balance is net of taxes: gross - taxes == balance.
+        assert!((i.gross_amount.unwrap() - i.taxes.unwrap() - i.balance.unwrap()).abs() < 0.01);
+    }
+
+    #[test]
+    fn missing_original_amount_falls_back_to_current_price_as_cost() {
+        let h = map_net(&inv("x", Some(200.0), Some(4.0))).unwrap();
+        assert_eq!(Some(h.average_cost), h.unit_price);
+    }
+
+    fn card_tx(id: &str, kind: &str, amount: f64, status: &str) -> PluggyTransaction {
+        let mut t = tx(id, kind, amount, "2026-09-01T00:00:00.000Z", Some(status));
+        t.credit_card_metadata = Some(PluggyCardMeta {
+            bill_id: Some("bill-1".into()),
+        });
+        t
+    }
+
+    #[test]
+    fn card_charges_and_payments_follow_real_sign_semantics() {
+        // Real data: purchases are DEBIT with a positive amount, payments CREDIT with a negative one.
+        let charge = map_card_transaction(
+            "c",
+            "wf",
+            "BRL",
+            None,
+            &card_tx("1", "DEBIT", 49.9, "POSTED"),
+        )
+        .unwrap();
+        assert_eq!(charge.activity_type, "WITHDRAWAL");
+        assert_eq!(charge.amount, Some(Decimal::new(4990, 2)));
+        assert!(charge.metadata.unwrap().contains("bill-1"));
+        let pay = map_card_transaction(
+            "c",
+            "wf",
+            "BRL",
+            None,
+            &card_tx("2", "CREDIT", -500.0, "POSTED"),
+        )
+        .unwrap();
+        assert_eq!(pay.activity_type, "DEPOSIT");
+        assert_eq!(pay.amount, Some(Decimal::from(500)));
+    }
+
+    #[test]
+    fn card_pending_and_inconsistent_transactions_are_skipped() {
+        assert!(map_card_transaction(
+            "c",
+            "wf",
+            "BRL",
+            None,
+            &card_tx("1", "DEBIT", 10.0, "PENDING")
+        )
+        .is_none());
+        assert!(map_card_transaction(
+            "c",
+            "wf",
+            "BRL",
+            None,
+            &card_tx("2", "DEBIT", -10.0, "POSTED")
+        )
+        .is_none());
+        assert!(map_card_transaction(
+            "c",
+            "wf",
+            "BRL",
+            None,
+            &card_tx("3", "CREDIT", 10.0, "POSTED")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn card_import_is_idempotent() {
+        let mk = || {
+            vec![map_card_transaction(
+                "c",
+                "wf",
+                "BRL",
+                None,
+                &card_tx("1", "DEBIT", 9.0, "POSTED"),
+            )
+            .unwrap()]
+        };
+        let (fresh, _) = drop_existing(mk(), &HashSet::new());
+        let existing: HashSet<String> = fresh
+            .iter()
+            .filter_map(|a| a.idempotency_key.clone())
+            .collect();
+        assert!(drop_existing(mk(), &existing).0.is_empty());
+    }
+
+    #[test]
+    fn links_enforce_card_vs_bank_account_types() {
+        assert!(check_link_compat("CREDIT", "CREDIT_CARD").is_ok());
+        assert!(check_link_compat("BANK", "CASH").is_ok());
+        assert!(check_link_compat("CREDIT", "CASH").is_err());
+        assert!(check_link_compat("BANK", "CREDIT_CARD").is_err());
+    }
+
+    fn wf(id: &str, name: &str) -> Account {
+        Account {
+            id: id.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn candidates_match_on_institution_tokens_not_substrings() {
+        let existing = vec![
+            wf("btg", "BTG"),
+            wf("bv", "BV"),
+            wf("bvm", "BV Mãe"),
+            wf("mp", "Mercado Pago"),
+            wf("mp2", "Mercado Pago 2"),
+            wf("nu", "Nubank"),
+        ];
+        assert_eq!(
+            match_names(&["MeuPluggy · BTG Investimentos", "BTG Banking"], &existing),
+            vec!["btg"]
+        );
+        // "BV" matches the BV account, not "BV Mãe" (its extra token is absent).
+        assert_eq!(
+            match_names(&["MeuPluggy · BANCO BV S.A."], &existing),
+            vec!["bv"]
+        );
+        // Only the account whose every token appears is a candidate.
+        assert_eq!(
+            match_names(&["MeuPluggy · Mercado Pago (Conta Pré-paga)"], &existing),
+            vec!["mp"]
+        );
+        assert!(match_names(&["Unknown Bank"], &existing).is_empty());
     }
 }
