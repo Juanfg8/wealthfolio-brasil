@@ -59,7 +59,15 @@ COPY apps/server ./apps/server
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 RUN mkdir -p apps/tauri/src && echo "fn main(){}" > apps/tauri/src/main.rs && echo "" > apps/tauri/src/lib.rs
 RUN mkdir -p apps/server/src && \
-    echo "fn main(){}" > apps/server/src/main.rs && \
+    echo "fn main(){}" > apps/server/src/main.rs
+# Cache mounts persist the registry download and compiled dependency
+# artifacts across builds, independent of Docker layer invalidation (unlike
+# the layer cache, a cache mount survives even when an earlier COPY's content
+# changes). This is what actually saves time on a source-only change: without
+# it, every rebuild recompiles the whole dependency graph from scratch.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETPLATFORM \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-$TARGETPLATFORM \
+    --mount=type=cache,target=/app/target,id=cargo-target-$TARGETPLATFORM \
     xx-cargo fetch --locked --manifest-path apps/server/Cargo.toml
 
 # Now copy full sources
@@ -68,9 +76,14 @@ COPY apps/server ./apps/server
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 ENV OPENSSL_STATIC=1
 ENV CARGO_BUILD_JOBS=2
-# Build using xx-cargo which handles target flags
-RUN xx-cargo build --locked --release --manifest-path apps/server/Cargo.toml && \
-    # Move the binary to a predictable location because the target dir changes with --target
+# Build using xx-cargo which handles target flags. Same cache mounts as the
+# fetch step above, so dependency builds carry over between images.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETPLATFORM \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-$TARGETPLATFORM \
+    --mount=type=cache,target=/app/target,id=cargo-target-$TARGETPLATFORM \
+    xx-cargo build --locked --release --manifest-path apps/server/Cargo.toml && \
+    # Move the binary out of the cache-mounted target dir to a predictable,
+    # persisted location (the mount disappears once the RUN step ends).
     cp target/$(xx-cargo --print-target-triple)/release/wealthfolio-server /wealthfolio-server
 
 # Final stage
