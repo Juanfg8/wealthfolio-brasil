@@ -2268,9 +2268,19 @@ impl PerformanceService {
 
         let (start_utc, end_utc) = Self::activity_query_utc_bounds(start_date, end_date);
 
+        // Interest is typically booked as a single lump on the day it's posted, but it
+        // accrued continuously since the *previous* posting for that account. A window
+        // whose start falls mid-accrual (e.g. two monthly postings 18 days apart, with
+        // a 30-day window landing across both) must not credit the whole lump — only
+        // the slice of its accrual span that overlaps the window. Pull a lookback of
+        // prior Interest activity so each in-window posting can find its own previous
+        // anchor, even when that anchor predates the window.
+        const INTEREST_ACCRUAL_LOOKBACK_DAYS: i64 = 400;
+        let lookback_start_utc = start_utc - Duration::days(INTEREST_ACCRUAL_LOOKBACK_DAYS);
+
         let activities = match activity_repository.get_activities_by_account_ids_in_date_range(
             account_ids,
-            start_utc,
+            lookback_start_utc,
             end_utc,
         ) {
             Ok(activities) => activities,
@@ -2282,6 +2292,23 @@ impl PerformanceService {
                 return AttributionEffectSet::default();
             }
         };
+
+        let mut prior_interest_dates: HashMap<String, Vec<NaiveDate>> = HashMap::new();
+        for activity in &activities {
+            if !activity.is_posted() {
+                continue;
+            }
+            if activity.effective_type() != ActivityType::Interest.as_str() {
+                continue;
+            }
+            prior_interest_dates
+                .entry(activity.account_id.clone())
+                .or_default()
+                .push(self.activity_local_date(activity));
+        }
+        for dates in prior_interest_dates.values_mut() {
+            dates.sort();
+        }
 
         let mut effects = Vec::new();
         let mut warnings = Vec::new();
@@ -2301,6 +2328,20 @@ impl PerformanceService {
             };
             let (raw_income, raw_fees, raw_taxes) =
                 Self::activity_attribution_components(&activity, &activity_type);
+            let accrual_fraction = if activity_type == ActivityType::Interest {
+                Self::interest_accrual_overlap_fraction(
+                    prior_interest_dates.get(&activity.account_id),
+                    activity_date,
+                    start_date,
+                )
+            } else {
+                Decimal::ONE
+            };
+            let (raw_income, raw_fees, raw_taxes) = (
+                raw_income * accrual_fraction,
+                raw_fees * accrual_fraction,
+                raw_taxes * accrual_fraction,
+            );
             let event_kind = match activity_type {
                 ActivityType::Dividend | ActivityType::Interest => EconomicEventKind::Income,
                 ActivityType::Fee => EconomicEventKind::Fee,
@@ -2375,6 +2416,34 @@ impl PerformanceService {
             warnings,
             complete: true,
         }
+    }
+
+    /// Fraction of an Interest activity's own accrual span (from the account's
+    /// previous Interest posting, exclusive, to this posting, inclusive) that
+    /// overlaps the queried window (from `window_start`, exclusive, to this
+    /// posting's date, which is already confirmed <= the window end by the
+    /// caller). Without a discoverable previous posting within the lookback,
+    /// the accrual span is unknown, so the full amount stays on its date —
+    /// the previous, unprorated behavior.
+    fn interest_accrual_overlap_fraction(
+        account_interest_dates: Option<&Vec<NaiveDate>>,
+        activity_date: NaiveDate,
+        window_start: NaiveDate,
+    ) -> Decimal {
+        let Some(dates) = account_interest_dates else {
+            return Decimal::ONE;
+        };
+        let previous_date = dates.iter().rfind(|&&date| date < activity_date).copied();
+        let Some(previous_date) = previous_date else {
+            return Decimal::ONE;
+        };
+        let span_days = (activity_date - previous_date).num_days();
+        if span_days <= 0 {
+            return Decimal::ONE;
+        }
+        let overlap_start = previous_date.max(window_start);
+        let overlap_days = (activity_date - overlap_start).num_days().max(0);
+        Decimal::from(overlap_days) / Decimal::from(span_days)
     }
 
     fn activity_attribution_components(
@@ -13194,9 +13263,12 @@ mod tests {
         )
         .await;
 
-        // 1M: August interest (1,500) + real post-link appreciation (50).
-        // The 9,800 book gap and the 300 link-day drift are migration, not return.
-        assert_eq!(one_month.summary.amount, Some(dec!(1550)));
+        // 1M: the August interest posting (1,500) accrued over the 92 days since
+        // the May posting; only the 9 days of that span inside the 1M window
+        // (Aug 22-31) are this window's return: 1500 * 9/92 = 146.7391..., plus
+        // real post-link appreciation (50). The 9,800 book gap and the 300
+        // link-day drift are migration, not return.
+        assert_eq!(one_month.summary.amount, Some(dec!(196.73913043)));
         // 6M: May + August interest + post-link appreciation. The 20,000
         // deposit and the 10,000 withdrawal contribute nothing.
         assert_eq!(six_months.summary.amount, Some(dec!(2550)));
@@ -13355,7 +13427,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(one_month.summary.amount, Some(dec!(1400)));
+        // The August interest posting (1,400) accrued over the 123 days since
+        // the April posting; only the 9 days inside the 1M window (Aug 22-31)
+        // count as this window's return: 1400 * 9/123 = 102.4390...
+        assert_eq!(one_month.summary.amount, Some(dec!(102.43902439)));
         assert_eq!(six_months.summary.amount, Some(dec!(2600)));
         assert_percent_matches_amount_over_average_capital(
             &one_month,
@@ -13369,5 +13444,53 @@ mod tests {
             "2026-03-01",
             "2026-09-22",
         );
+    }
+
+    /// Interest is booked as a single lump on the day it's posted, but it accrued
+    /// continuously since the account's previous posting. A window whose start
+    /// falls mid-accrual must credit only the slice of each posting's own accrual
+    /// span that overlaps the window - not the full lump for every posting whose
+    /// date happens to land inside the window. Real production accounts post
+    /// interest at irregular, sometimes-18-days-apart dates (a reconciliation, a
+    /// mid-month payout), and a 1M window landing across two such postings was
+    /// crediting the full amount of both - compressing ~49 days of real accrual
+    /// into a 30-day display window.
+    #[tokio::test]
+    async fn interest_accrual_is_prorated_across_its_own_posting_gap() {
+        let history =
+            period_daily_history("irregular", "2026-05-01", "2026-08-31", |_| PeriodDay {
+                cash: dec!(40000),
+                invested: Decimal::ZERO,
+                cost: Decimal::ZERO,
+                net_contribution: dec!(40000),
+                inflow: Decimal::ZERO,
+                outflow: Decimal::ZERO,
+            });
+        let activities = vec![
+            cad_income("irr-jun", "irregular", "2026-06-30", dec!(700)),
+            cad_income("irr-jul", "irregular", "2026-07-31", dec!(700)),
+            cad_income("irr-aug", "irregular", "2026-08-18", dec!(400)),
+        ];
+
+        // 1M window (2026-07-22, 2026-08-21]: only the July posting's last 9 of
+        // its 31 accrual days fall inside, and the August posting's full 18-day
+        // span falls entirely inside. 700*9/31 + 400 = 603.2258...
+        let one_month = dashboard_holdings_period(
+            history.clone(),
+            activities.clone(),
+            "irregular",
+            "2026-07-22",
+            "2026-08-21",
+        )
+        .await;
+        assert_eq!(one_month.summary.amount, Some(dec!(603.22580645)));
+
+        // A window containing every posting's full accrual span sees the exact
+        // sum of the real postings - proration reallocates return across window
+        // boundaries, it never fabricates or destroys it.
+        let full_window =
+            dashboard_holdings_period(history, activities, "irregular", "2026-05-01", "2026-08-31")
+                .await;
+        assert_eq!(full_window.summary.amount, Some(dec!(1800)));
     }
 }
