@@ -508,10 +508,28 @@ pub fn load_state(data_root: &str) -> PluggyState {
 }
 
 fn save_state(data_root: &str, state: &PluggyState) -> Result<()> {
+    use std::io::Write;
     let path = state_path(data_root);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+    {
+        // Explicit fsync before the rename: a crash between `fs::write` returning and
+        // the data actually reaching disk can otherwise resurrect the file's *previous*
+        // content after an abrupt restart - silently reverting cost basis, flow ids and
+        // last-synced timestamps to a stale state.
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(state)?)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)?;
+    // Best-effort: without also syncing the directory entry, the rename itself is not
+    // guaranteed durable on every filesystem. Not fatal if the platform disallows
+    // opening a directory this way (e.g. some sandboxes) - the file's own fsync above
+    // is the part that actually protects the state's contents from corruption.
+    if let Some(dir) = path.parent() {
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1966,6 +1984,38 @@ pub fn start_scheduler(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_state_round_trips_and_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        let mut state = PluggyState::default();
+        state.items.insert(
+            "item-1".into(),
+            ItemLink {
+                item_id: "item-1".into(),
+                institution: Some("BTG".into()),
+                status: LinkStatus::Linked,
+                linked_account_id: Some("wf-1".into()),
+                positions_written: 1,
+                candidates: vec![],
+                pluggy_updated_at: None,
+                total_value: Some(1000.0),
+                last_synced_at: Some("2026-09-22T00:00:00Z".into()),
+                last_error: None,
+            },
+        );
+
+        save_state(root, &state).unwrap();
+        let reloaded = load_state(root);
+        assert_eq!(reloaded.items.len(), 1);
+        assert_eq!(reloaded.items["item-1"].institution.as_deref(), Some("BTG"));
+
+        // The atomic write must not leave a stray .tmp file behind.
+        assert!(!dir.path().join("pluggy_state.json.tmp").exists());
+        assert!(dir.path().join("pluggy_state.json").exists());
+    }
 
     #[test]
     fn missing_total_pages_falls_back_to_a_full_page_check() {
