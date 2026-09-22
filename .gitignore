@@ -143,3 +143,6 @@ finalize_observed_interest_*.py
 reconstruct_interest_*.py
 validate_caixa_dagua_*.py
 ledger_approval_gate_*.md
+
+# Claude Code agent worktrees (harness-managed, never tracked)
+.claude/worktrees/
