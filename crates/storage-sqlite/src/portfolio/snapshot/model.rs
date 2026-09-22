@@ -112,8 +112,15 @@ impl TryFrom<AccountStateSnapshotDB> for AccountStateSnapshot {
                 );
                 Utc::now().naive_utc()
             }),
-            source: serde_json::from_str(&format!("\"{}\"", db.source))
-                .unwrap_or(SnapshotSource::Calculated),
+            source: match db.source.as_str() {
+                // `MANUAL` is the legacy persisted spelling for a manually
+                // maintained holdings keyframe. Treating it as CALCULATED
+                // prevents later cash or position changes from being
+                // classified as external flows.
+                "MANUAL" => SnapshotSource::ManualEntry,
+                _ => serde_json::from_str(&format!("\"{}\"", db.source))
+                    .unwrap_or(SnapshotSource::Calculated),
+            },
         })
     }
 }
@@ -162,6 +169,31 @@ impl From<AccountStateSnapshot> for AccountStateSnapshotDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_db(source: &str) -> AccountStateSnapshotDB {
+        AccountStateSnapshotDB {
+            id: "snapshot".to_string(),
+            account_id: "account".to_string(),
+            snapshot_date: "2026-09-21".to_string(),
+            currency: "BRL".to_string(),
+            positions: "{}".to_string(),
+            cash_balances: "{}".to_string(),
+            cost_basis: "0".to_string(),
+            net_contribution: "0".to_string(),
+            calculated_at: "2026-09-21T00:00:00Z".to_string(),
+            net_contribution_base: "0".to_string(),
+            cash_total_account_currency: "0".to_string(),
+            cash_total_base_currency: "0".to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn legacy_manual_snapshot_is_a_manual_keyframe() {
+        let snapshot = AccountStateSnapshot::try_from(snapshot_db("MANUAL"))
+            .expect("legacy snapshot should deserialize");
+        assert_eq!(snapshot.source, SnapshotSource::ManualEntry);
+    }
 
     #[test]
     fn malformed_snapshot_date_is_not_coerced_to_epoch() {

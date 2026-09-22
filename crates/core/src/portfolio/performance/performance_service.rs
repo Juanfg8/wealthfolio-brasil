@@ -1710,7 +1710,9 @@ impl PerformanceService {
                 / Decimal::from(history.len());
             if average_value > Decimal::ZERO {
                 result.returns.value_return = Some(
-                    ((result.attribution.income - result.attribution.fees - result.attribution.taxes)
+                    ((result.attribution.income
+                        - result.attribution.fees
+                        - result.attribution.taxes)
                         / average_value)
                         .round_dp(DECIMAL_PRECISION),
                 );
@@ -2822,8 +2824,20 @@ impl PerformanceService {
         };
 
         let end_value = Self::return_total_value(end_point, flow_basis);
-        let delta_total_value =
-            Self::attribution_total_value_delta(start_point, end_point, flow_basis, baseline);
+        let delta_total_value = if result.is_holdings_mode {
+            let start_gain = if matches!(baseline, AttributionBaseline::Inception) {
+                Decimal::ZERO
+            } else {
+                Self::return_investment_market_value(start_point, flow_basis)
+                    - Self::return_cost_basis(start_point, flow_basis)
+            };
+            (Self::return_investment_market_value(end_point, flow_basis)
+                - Self::return_cost_basis(end_point, flow_basis)
+                - start_gain)
+                .round_dp(DECIMAL_PRECISION)
+        } else {
+            Self::attribution_total_value_delta(start_point, end_point, flow_basis, baseline)
+        };
         result.attribution.residual = Decimal::ZERO;
         let unreconciled_delta =
             Self::attribution_unreconciled_delta(delta_total_value, &result.attribution);
@@ -2841,11 +2855,9 @@ impl PerformanceService {
     /// HOLDINGS mode doesn't track cash flows at the transaction level, so
     /// TWR/IRR aren't meaningful — we measure unrealized P&L growth instead.
     ///
-    /// * `daily_flows` — external flows over the period. Dated ranges subtract
-    ///   flows with explicit gross provenance (e.g. keyframe flows inferred by
-    ///   the valuation layer) so deposits and withdrawals don't read as gains.
-    ///   NetContributionFallback deltas stay excluded: on holdings series a
-    ///   net-contribution jump is bookkeeping backfill, not a dated flow.
+    /// * `daily_flows` — used only to preserve realized return through a fully
+    ///   withdrawn position. Ordinary dated cash movements are neutralized by
+    ///   comparing investment gain over cost basis instead of total value.
     /// * `is_all_time` — when `true`, measures gain versus ending book basis
     ///   (the recorded invested capital). When `false`, measures flow-adjusted
     ///   total value change over starting value. Non-positive denominators make
@@ -2873,10 +2885,26 @@ impl PerformanceService {
         }
 
         let start_value = Self::return_total_value(start_point, flow_basis);
-        let net_explicit_flow = Self::net_explicit_gross_flow(daily_flows);
-        let value_change = Self::return_total_value(end_point, flow_basis)
-            - Self::return_total_value(start_point, flow_basis)
-            - net_explicit_flow;
+        // Holdings snapshots do not have transaction-level cash-flow dates.
+        // Compare investment gain over cost basis instead of total account
+        // value: cash deposits, withdrawals and reconciliation adjustments
+        // remain neutral even when they occur between snapshots.
+        let gain_change = (Self::return_investment_market_value(end_point, flow_basis)
+            - Self::return_cost_basis(end_point, flow_basis))
+            - (Self::return_investment_market_value(start_point, flow_basis)
+                - Self::return_cost_basis(start_point, flow_basis));
+        // If a position is fully withdrawn, its unrealized gain disappears
+        // with the position. Preserve that realized return through the
+        // explicit withdrawal flow instead of reporting it as a loss.
+        let value_change = if Self::return_total_value(end_point, flow_basis).is_zero()
+            && !Self::net_explicit_gross_flow(daily_flows).is_zero()
+        {
+            Self::return_total_value(end_point, flow_basis)
+                - Self::return_total_value(start_point, flow_basis)
+                - Self::net_explicit_gross_flow(daily_flows)
+        } else {
+            gain_change
+        };
         let value_return = if start_value <= Decimal::ZERO {
             None
         } else {
@@ -3350,7 +3378,8 @@ impl PerformanceService {
 
         metrics.scope.id = scope_id.to_string();
         if profile == PerformanceSummaryProfile::Dashboard
-            && !(metrics.is_holdings_mode && !Self::all_accounts_are_crypto(account_ids, account_types))
+            && !(metrics.is_holdings_mode
+                && !Self::all_accounts_are_crypto(account_ids, account_types))
         {
             return Ok(metrics);
         }
@@ -3599,16 +3628,31 @@ impl PerformanceService {
                 let prev = &window[0];
                 let curr = &window[1];
                 let prev_value = Self::return_total_value(prev, flow_basis);
-                let curr_value = Self::return_total_value(curr, flow_basis);
+                let prev_gain = Self::return_investment_market_value(prev, flow_basis)
+                    - Self::return_cost_basis(prev, flow_basis);
+                let curr_gain = Self::return_investment_market_value(curr, flow_basis)
+                    - Self::return_cost_basis(curr, flow_basis);
                 let flow = daily_flows[index];
-                // Same filter as the holdings headline: only explicit gross
-                // flows are real dated flows on a holdings series.
-                let (flow_inflow, flow_outflow) = if flow.source.is_explicit_gross() {
-                    (flow.inflow, flow.outflow)
+                let flow_inflow = if flow.source.is_explicit_gross() {
+                    flow.inflow
                 } else {
-                    (Decimal::ZERO, Decimal::ZERO)
+                    Decimal::ZERO
                 };
-                let day_gain = curr_value + flow_outflow - prev_value - flow_inflow;
+                // Holdings snapshots do not reliably date cash movements. The
+                // gain change is the native flow-neutral measure: principal
+                // entering or leaving cash/positions changes value and basis
+                // together, while yield changes gain.
+                let day_gain = if Self::return_total_value(curr, flow_basis).is_zero()
+                    && flow.source.is_explicit_gross()
+                    && flow.outflow > Decimal::ZERO
+                    && prev_gain > Decimal::ZERO
+                {
+                    // A full withdrawal realizes the accumulated gain; the
+                    // empty closing row must not turn it into a loss.
+                    Decimal::ZERO
+                } else {
+                    curr_gain - prev_gain
+                };
                 if prev_value > Decimal::ZERO {
                     has_return_base = true;
                     // Crypto deposits are treated as arriving at the start of
@@ -4106,21 +4150,18 @@ impl PerformanceService {
             {
                 return Vec::new();
             }
-            let mut net_flow = Decimal::ZERO;
+            let start_gain = Self::return_investment_market_value(start_point, flow_basis)
+                - Self::return_cost_basis(start_point, flow_basis);
             return component
                 .history
                 .iter()
                 .skip(1)
-                .zip(daily_flows.iter())
-                .map(|(point, flow)| {
-                    if flow.source.is_explicit_gross() {
-                        net_flow += flow.net();
-                    }
+                .map(|point| {
+                    let current_gain = Self::return_investment_market_value(point, flow_basis)
+                        - Self::return_cost_basis(point, flow_basis);
                     MixedScopeSeriesPoint {
                         date: point.valuation_date,
-                        amount: Self::return_total_value(point, flow_basis)
-                            - start_value
-                            - net_flow,
+                        amount: current_gain - start_gain,
                         denominator,
                     }
                 })
@@ -5153,9 +5194,12 @@ impl PerformanceService {
         _previous: Option<&DailyAccountValuation>,
         total_portfolio_value_base: Option<Decimal>,
     ) -> SimplePerformanceMetrics {
-        // Use self for the current valuation data
-        let total_gain_loss_amount = current.total_value - current.net_contribution;
-        let denominator_cumulative_return = current.net_contribution;
+        // Cash is part of current value, but it is not investment return.
+        // `book_basis` includes cash principal plus investment cost basis, so
+        // this remains flow-neutral for transfers, reconciliation changes and
+        // ordinary cash movements while preserving investment yield.
+        let total_gain_loss_amount = current.total_value - current.book_basis;
+        let denominator_cumulative_return = current.book_basis;
         let cumulative_return_percent = if !denominator_cumulative_return.is_zero() {
             Some((total_gain_loss_amount / denominator_cumulative_return).round_dp(4))
         } else if total_gain_loss_amount.is_zero() {
@@ -10781,6 +10825,88 @@ mod tests {
         assert_eq!(result.returns.twr.unwrap().round_dp(4), dec!(0.05));
     }
 
+    #[test]
+    fn holdings_period_excludes_cash_transfer_but_keeps_investment_yield() {
+        let mut cash_transfer = vec![
+            valuation(
+                "2026-06-12",
+                dec!(5000),
+                dec!(5000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-06-19",
+                dec!(10000),
+                dec!(10000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        cash_transfer[0].book_basis = dec!(5000);
+        cash_transfer[1].book_basis = dec!(10000);
+        let transfer_result = PerformanceService::compute_account_performance(
+            &cash_transfer,
+            Some(TrackingMode::Holdings),
+            Some(date("2026-06-12")),
+            false,
+        )
+        .expect("cash transfer performance should compute");
+        assert_eq!(attribution_pnl(&transfer_result), Decimal::ZERO);
+        assert_eq!(transfer_result.returns.value_return, Some(Decimal::ZERO));
+
+        let yield_history = vec![
+            valuation(
+                "2026-06-12",
+                dec!(5000),
+                Decimal::ZERO,
+                dec!(5000),
+                dec!(5000),
+            ),
+            valuation(
+                "2026-06-19",
+                dec!(5100),
+                Decimal::ZERO,
+                dec!(5100),
+                dec!(5000),
+            ),
+        ];
+        let yield_result = PerformanceService::compute_account_performance(
+            &yield_history,
+            Some(TrackingMode::Holdings),
+            Some(date("2026-06-12")),
+            false,
+        )
+        .expect("investment yield performance should compute");
+        assert_eq!(attribution_pnl(&yield_result), dec!(100));
+        assert_eq!(yield_result.returns.value_return, Some(dec!(0.02)));
+    }
+
+    #[test]
+    fn simple_performance_uses_book_basis_instead_of_net_contribution() {
+        let mut current = valuation(
+            "2026-06-19",
+            dec!(10000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        current.book_basis = dec!(10000);
+        let transfer =
+            PerformanceService::calculate_simple_performance(&current, None, Some(dec!(10000)));
+        assert_eq!(transfer.total_gain_loss_amount, Some(Decimal::ZERO));
+        assert_eq!(transfer.cumulative_return_percent, Some(Decimal::ZERO));
+
+        current.total_value = dec!(5100);
+        current.investment_market_value = dec!(5100);
+        current.cost_basis = dec!(5000);
+        current.book_basis = dec!(5000);
+        let yield_metrics =
+            PerformanceService::calculate_simple_performance(&current, None, Some(dec!(5100)));
+        assert_eq!(yield_metrics.total_gain_loss_amount, Some(dec!(100)));
+        assert_eq!(yield_metrics.cumulative_return_percent, Some(dec!(0.02)));
+    }
+
     /// HOLDINGS mode uses gain-vs-book-basis for all-time. TWR/IRR are returned
     /// as `None` because they aren't meaningful without per-transaction
     /// cash-flow tracking.
@@ -10811,7 +10937,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_holdings_mode_period_uses_value_change_not_book_basis_delta() {
+    fn perf_holdings_mode_period_uses_investment_gain_change_not_cash_value_delta() {
         let history = vec![
             valuation(
                 "2026-06-12",
@@ -10839,9 +10965,9 @@ mod tests {
 
         assert_eq!(
             result.returns.value_return.unwrap().round_dp(4),
-            dec!(0.0112)
+            dec!(-0.0062)
         );
-        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(1186.08));
+        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(-661.53));
         assert_eq!(result.attribution.contributions, Decimal::ZERO);
         assert_eq!(result.attribution.residual, Decimal::ZERO);
     }
@@ -11276,15 +11402,15 @@ mod tests {
 
         assert!(result.is_mixed_tracking_mode);
         assert_eq!(result.mode, ReturnMethod::ValueReturn);
-        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(3972.94));
+        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(2360.22));
         assert_eq!(
             result.returns.value_return.unwrap().round_dp(4),
-            dec!(0.0130)
+            dec!(0.0077)
         );
         assert_eq!(result.attribution.contributions, Decimal::ZERO);
         assert_eq!(
             result.series.last().unwrap().value.round_dp(4),
-            dec!(0.0130)
+            dec!(0.0077)
         );
     }
 
@@ -11352,9 +11478,12 @@ mod tests {
         )
         .expect("mixed scope should compute transaction flows at account level");
 
-        assert_eq!(attribution_pnl(&result), dec!(150));
+        assert_eq!(attribution_pnl(&result), dec!(100));
         assert_eq!(result.attribution.contributions, dec!(100));
-        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.1));
+        assert_eq!(
+            result.returns.value_return.unwrap().round_dp(4),
+            dec!(0.0667)
+        );
     }
 
     #[test]
@@ -11429,10 +11558,10 @@ mod tests {
         )
         .expect("mixed scope should build a component-level series");
 
-        assert_eq!(attribution_pnl(&result), dec!(250));
+        assert_eq!(attribution_pnl(&result), dec!(200));
         assert_eq!(
             result.returns.value_return.unwrap().round_dp(4),
-            dec!(0.1667)
+            dec!(0.1333)
         );
         assert_eq!(result.series.len(), 3);
         assert_eq!(result.series[0].date, date("2026-06-12"));
@@ -11440,7 +11569,7 @@ mod tests {
         assert_eq!(result.series[1].date, date("2026-06-13"));
         assert_eq!(result.series[1].value.round_dp(4), dec!(0.1));
         assert_eq!(result.series[2].date, date("2026-06-14"));
-        assert_eq!(result.series[2].value.round_dp(4), dec!(0.1667));
+        assert_eq!(result.series[2].value.round_dp(4), dec!(0.1333));
     }
 
     #[test]
@@ -11593,7 +11722,7 @@ mod tests {
         )
         .expect("mixed scope should compute with a degraded denominator");
 
-        assert_eq!(attribution_pnl(&result), dec!(150));
+        assert_eq!(attribution_pnl(&result), dec!(100));
         assert_eq!(result.returns.value_return, None);
         assert!(result.series.is_empty());
         assert!(result.data_quality.warnings.iter().any(|warning| {
@@ -11755,9 +11884,15 @@ mod tests {
         )
         .expect("mixed scope should degrade negative component");
 
-        assert_eq!(attribution_pnl(&result), dec!(50));
-        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.1));
-        assert_eq!(result.series.last().unwrap().value.round_dp(4), dec!(0.1));
+        assert_eq!(attribution_pnl(&result), Decimal::ZERO);
+        assert_eq!(
+            result.returns.value_return.unwrap().round_dp(4),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            result.series.last().unwrap().value.round_dp(4),
+            Decimal::ZERO
+        );
         assert!(result
             .data_quality
             .warnings
@@ -11833,8 +11968,11 @@ mod tests {
 
         assert_eq!(result.scope.id, "mixed-scope");
         assert!(result.is_mixed_tracking_mode);
-        assert_eq!(attribution_pnl(&result), dec!(150));
-        assert_eq!(result.returns.value_return.unwrap().round_dp(4), dec!(0.1));
+        assert_eq!(attribution_pnl(&result), dec!(100));
+        assert_eq!(
+            result.returns.value_return.unwrap().round_dp(4),
+            dec!(0.0667)
+        );
     }
 
     #[tokio::test]
@@ -11914,12 +12052,12 @@ mod tests {
             .expect("mixed summary should enrich transaction attribution");
 
         assert_eq!(result.attribution.income, dec!(50));
-        assert_eq!(result.attribution.unrealized_pnl_change, dec!(50));
+        assert_eq!(result.attribution.unrealized_pnl_change, Decimal::ZERO);
         assert_eq!(result.attribution.residual, Decimal::ZERO);
-        assert_eq!(attribution_pnl(&result), dec!(100));
+        assert_eq!(attribution_pnl(&result), dec!(50));
         assert_eq!(
             result.returns.value_return.unwrap().round_dp(4),
-            dec!(0.0667)
+            dec!(0.0333)
         );
     }
 
@@ -12000,11 +12138,11 @@ mod tests {
             .expect("mixed dashboard summary should skip detailed attribution");
 
         assert_eq!(result.attribution.income, Decimal::ZERO);
-        assert_eq!(result.attribution.unrealized_pnl_change, dec!(100));
-        assert_eq!(attribution_pnl(&result), dec!(100));
+        assert_eq!(result.attribution.unrealized_pnl_change, dec!(50));
+        assert_eq!(attribution_pnl(&result), dec!(50));
         assert_eq!(
             result.returns.value_return.unwrap().round_dp(4),
-            dec!(0.0667)
+            dec!(0.0333)
         );
     }
 
