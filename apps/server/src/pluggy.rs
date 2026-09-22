@@ -1599,9 +1599,8 @@ async fn sync_inner(
                     }
                     let u = apply_reserve_flows(r, &txs, &today_str);
                     if u.bootstrapped {
-                        match (&model_seed, wants_model) {
-                            (Some(seed), true) => apply_modeled_history(r, seed),
-                            _ => {}
+                        if let (Some(seed), true) = (&model_seed, wants_model) {
+                            apply_modeled_history(r, seed);
                         }
                         info!("Pluggy reserve bootstrapped");
                     }

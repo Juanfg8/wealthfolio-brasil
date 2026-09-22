@@ -133,7 +133,7 @@ async fn diagnostics_summary_requires_auth_and_reports_expected_shape() {
         .is_empty());
 
     // Build info always present.
-    assert!(body["build"]["version"].as_str().unwrap().len() > 0);
+    assert!(!body["build"]["version"].as_str().unwrap().is_empty());
 
     cleanup_env();
 }

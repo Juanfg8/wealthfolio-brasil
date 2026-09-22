@@ -3190,7 +3190,7 @@ impl PerformanceService {
         // Yield/cash holdings accounts still need the income-based return, so only
         // market-valued or transaction accounts take the cheap dashboard shortcut.
         if profile == PerformanceSummaryProfile::Dashboard
-            && !(metrics.is_holdings_mode && !Self::is_crypto_account_type(account_type))
+            && (!metrics.is_holdings_mode || Self::is_crypto_account_type(account_type))
         {
             return Ok(metrics);
         }
@@ -3378,8 +3378,8 @@ impl PerformanceService {
 
         metrics.scope.id = scope_id.to_string();
         if profile == PerformanceSummaryProfile::Dashboard
-            && !(metrics.is_holdings_mode
-                && !Self::all_accounts_are_crypto(account_ids, account_types))
+            && (!metrics.is_holdings_mode
+                || Self::all_accounts_are_crypto(account_ids, account_types))
         {
             return Ok(metrics);
         }
@@ -3510,6 +3510,9 @@ impl PerformanceService {
         )
     }
 
+    // Pre-existing internal fan-in point for the several performance-summary entry
+    // points above; splitting it into a struct is a real refactor out of scope here.
+    #[allow(clippy::too_many_arguments)]
     fn compute_account_performance_with_flow_basis(
         full_history: &[DailyAccountValuation],
         tracking_mode: Option<TrackingMode>,
