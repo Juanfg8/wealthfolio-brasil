@@ -44,6 +44,10 @@ fn sync_interval() -> Duration {
     Duration::from_secs(hours * 60 * 60)
 }
 
+/// Serializes every read-modify-write of `pluggy_state.json`: the sync and the
+/// link endpoints both rewrite the whole file, so without this a link applied
+/// mid-sync is silently clobbered — or clobbers the cost basis and the recorded
+/// flow ids the sync just wrote, which would let a Caixinha movement be counted twice.
 static SYNC_LOCK: Mutex<()> = Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
@@ -1685,6 +1689,9 @@ pub fn apply_link(
     since: Option<&str>,
     ignore: bool,
 ) -> Result<AccountState> {
+    let _guard = SYNC_LOCK
+        .try_lock()
+        .map_err(|_| anyhow!("a Pluggy sync is running; retry the link once it finishes"))?;
     let mut st = load_state(&state.data_root);
     if let Some(wf_id) = account_id {
         let wf = state.account_service.get_account(wf_id)?; // must exist
@@ -1738,6 +1745,9 @@ pub fn apply_item_link(
     account_id: Option<&str>,
     ignore: bool,
 ) -> Result<ItemLink> {
+    let _guard = SYNC_LOCK
+        .try_lock()
+        .map_err(|_| anyhow!("a Pluggy sync is running; retry the link once it finishes"))?;
     let mut st = load_state(&state.data_root);
     if let Some(wf_id) = account_id {
         let wf = state.account_service.get_account(wf_id)?;
