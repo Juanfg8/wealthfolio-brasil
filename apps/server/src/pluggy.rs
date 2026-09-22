@@ -436,6 +436,27 @@ pub fn merge_investments(
         .collect()
 }
 
+/// `merge_investments` only produces an entry for ids present in `fresh`, so an item
+/// whose `/investments` call failed entirely this run - contributing nothing to
+/// `fresh` - would otherwise have every one of its previously tracked records
+/// silently pruned from state, not just have its snapshot write blocked (which
+/// `item_snapshot_block_reason` already handles). Carries the old records for a
+/// failed item through unchanged, so the merge is a no-op for them instead of a
+/// deletion, and a later successful read doesn't re-bootstrap cost basis from
+/// `amountOriginal` as if the position were new.
+pub fn preserve_failed_items(
+    old: &[InvestmentState],
+    mut fresh: Vec<InvestmentState>,
+    investments_failed: &HashSet<String>,
+) -> Vec<InvestmentState> {
+    fresh.extend(
+        old.iter()
+            .filter(|i| investments_failed.contains(&i.item_id))
+            .cloned(),
+    );
+    fresh
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {
@@ -1436,6 +1457,7 @@ async fn sync_inner(
         &investments,
         &investments_queried_ok,
     );
+    let investments = preserve_failed_items(&st.investments, investments, &investments_failed);
     st.investments = merge_investments(&st.investments, investments);
     summary.accounts_seen = st.accounts.len();
     summary.needs_review = st
@@ -2780,19 +2802,18 @@ mod tests {
         assert!(no_prior_history.is_empty());
     }
 
-    /// OPEN DEFECT (Opus review): the snapshot guard protects the *write*, not the
-    /// *state*. `sync_inner` assigns `st.investments = merge_investments(&st.investments,
-    /// investments)` (pluggy.rs:1390) where `investments` only accumulated positions from
-    /// items whose `/investments` call succeeded this run. A failed item therefore has all
-    /// of its positions pruned out of the persisted state (`save_state` runs
-    /// unconditionally, pluggy.rs:1224). On the next successful run `old` no longer
-    /// contains them, so `merge_investments` takes the bootstrap arm and re-derives cost
-    /// basis from Pluggy's `amountOriginal` — discarding a tracked basis that had
-    /// deliberately diverged from it. That is the exact reset
+    /// FIXED (Opus review found this; `preserve_failed_items` closes it): the snapshot
+    /// guard protects the *write*, not the *state* by itself. `sync_inner` calls
+    /// `merge_investments(&st.investments, investments)` where `investments` only
+    /// accumulated positions from items whose `/investments` call succeeded this run.
+    /// Without `preserve_failed_items`, a failed item would have all of its positions
+    /// pruned out of the persisted state (`save_state` runs unconditionally), and the
+    /// next successful run would take the bootstrap arm and re-derive cost basis from
+    /// Pluggy's `amountOriginal` - discarding a tracked basis that had deliberately
+    /// diverged from it. That is the exact reset
     /// `account_migration_cost_basis_reset_would_manufacture_phantom_gain_without_this_guard`
     /// exists to prevent, reachable through nothing worse than one HTTP timeout.
     #[test]
-    #[ignore = "documents an open defect: a transient /investments failure prunes the item's positions from pluggy_state.json, so the next success re-bootstraps cost basis from amountOriginal"]
     fn a_transient_investments_failure_must_not_discard_tracked_cost_basis() {
         // Same shape as the production anomaly: tracked basis deliberately above
         // Pluggy's own `amountOriginal`.
@@ -2800,9 +2821,14 @@ mod tests {
         tracked.amount_original = Some(88000.0);
         tracked.cost_basis = Some(128143.98);
         tracked.cost_origin = Some("BOOTSTRAP".into());
+        let old = vec![tracked];
 
-        // Run N+1: `/investments` times out, so nothing is collected for this item.
-        let after_failure = merge_investments(std::slice::from_ref(&tracked), vec![]);
+        // Run N+1: `/investments` times out, so `investments` collects nothing for
+        // this item - exactly what sync_inner sees before calling preserve_failed_items.
+        let mut investments_failed: HashSet<String> = HashSet::new();
+        investments_failed.insert("item".into());
+        let preserved = preserve_failed_items(&old, vec![], &investments_failed);
+        let after_failure = merge_investments(&old, preserved);
         assert_eq!(
             after_failure.len(),
             1,
@@ -2819,6 +2845,28 @@ mod tests {
             Some(128143.98),
             "recovery re-bootstrapped cost from amountOriginal, manufacturing a 40143.98 gain"
         );
+    }
+
+    #[test]
+    fn preserve_failed_items_leaves_successful_items_untouched() {
+        let mut failed_item_inv = inv("failed-item-inv", Some(100.0), Some(1.0));
+        failed_item_inv.item_id = "failed".into();
+        let mut ok_item_inv = inv("ok-item-inv", Some(200.0), Some(1.0));
+        ok_item_inv.item_id = "ok".into();
+        let old = vec![failed_item_inv, ok_item_inv];
+        let mut investments_failed: HashSet<String> = HashSet::new();
+        investments_failed.insert("failed".into());
+
+        // Only "ok" was queried successfully this run and reported one (different) row.
+        let mut fresh_ok = inv("ok-item-inv", Some(250.0), Some(1.0));
+        fresh_ok.item_id = "ok".into();
+        let preserved = preserve_failed_items(&old, vec![fresh_ok], &investments_failed);
+
+        assert_eq!(preserved.len(), 2);
+        assert!(preserved.iter().any(|i| i.id == "failed-item-inv"));
+        assert!(preserved
+            .iter()
+            .any(|i| i.id == "ok-item-inv" && i.balance == Some(250.0)));
     }
 
     /// OPEN DEFECT (Opus review): `investments_failed` is only populated when `paged`
