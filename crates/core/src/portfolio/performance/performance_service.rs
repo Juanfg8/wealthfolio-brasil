@@ -11016,6 +11016,82 @@ mod tests {
         assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
     }
 
+    /// OPEN DEFECT (Opus review): `calculate_simple_performance` picks its basis with
+    /// `if current.net_contribution.is_zero() { book_basis } else { net_contribution }`.
+    /// Zero is overloaded: it means "HOLDINGS mode, never tracked" *and* "activity-tracked
+    /// and the withdrawals happen to have cancelled the deposits exactly". An account that
+    /// is emptied back to its contributed principal lands on the second meaning and
+    /// silently switches basis mid-history, so a real, already-reported gain reads as zero.
+    /// The account is not a corner case: withdrawing exactly what you put in is the
+    /// ordinary way to close a position and leave the yield behind.
+    #[test]
+    #[ignore = "documents an open defect: net_contribution == 0 on an activity-tracked account falls back to book_basis and erases real gain"]
+    fn withdrawing_exactly_the_principal_must_not_erase_the_earned_yield() {
+        // `book_basis` is cost_basis(0) + cash for a pure-cash account: what production
+        // actually computes, as the golden water-tank fixture above also spells out.
+        fn cash_valuation(date: &str, total_value: Decimal, nc: Decimal) -> DailyAccountValuation {
+            let mut v = valuation(date, total_value, nc, Decimal::ZERO, Decimal::ZERO);
+            v.book_basis = total_value;
+            v
+        }
+
+        // Deposit 5000, earn 100 -> +100, exactly as the golden scenario above.
+        let after_yield = cash_valuation("2026-06-12", dec!(5100), dec!(5000));
+        let m = PerformanceService::calculate_simple_performance(&after_yield, None, None);
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+
+        // Withdraw exactly the 5000 of principal, leaving only the earned 100 behind.
+        // net_contribution is now exactly zero; the 100 that is still there is pure yield.
+        let after_withdrawal = cash_valuation("2026-06-13", dec!(100), Decimal::ZERO);
+        let m = PerformanceService::calculate_simple_performance(&after_withdrawal, None, None);
+        assert_eq!(
+            m.total_gain_loss_amount,
+            Some(dec!(100)),
+            "basis fell back to book_basis (== cash == 100), so the earned 100 read as zero gain"
+        );
+    }
+
+    /// OPEN DEFECT (Opus review): the same basis is used as the denominator of
+    /// `cumulative_return_percent`. `net_contribution` is contributions *net of
+    /// withdrawals*, so on an account that is drawn down over time it shrinks toward zero
+    /// and then goes negative, while the numerator (`total_value - basis`) grows. The
+    /// reported percentage is therefore unbounded and eventually sign-flipped, with no
+    /// change in the underlying economics.
+    #[test]
+    #[ignore = "documents an open defect: net_contribution as the percent denominator is unbounded as withdrawals approach/exceed deposits"]
+    fn repeated_small_withdrawals_must_not_inflate_the_return_percentage() {
+        // Deposit 5000. Over many months, earn 100 and withdraw exactly that 100, 49
+        // times. Value is back at 5000 each time; net_contribution is 5000 - 4900 = 100.
+        let drawn_down = cash_valuation("2027-06-12", dec!(5000), dec!(100));
+        let m = PerformanceService::calculate_simple_performance(&drawn_down, None, None);
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(4900)));
+        // 4900 earned on 5000 of capital is +98%, not +4900%.
+        assert_eq!(
+            m.cumulative_return_percent,
+            Some(dec!(0.98)),
+            "percent used net-of-withdrawal contribution (100) as the denominator"
+        );
+    }
+
+    /// OPEN DEFECT (Opus review), same root cause: once total withdrawals exceed total
+    /// deposits — which is simply what closing a profitable account looks like —
+    /// `net_contribution` is negative and is used as the denominator unchanged, so the
+    /// reported cumulative return flips sign on an account that only ever made money.
+    #[test]
+    #[ignore = "documents an open defect: a negative net_contribution denominator flips the sign of cumulative_return_percent"]
+    fn fully_withdrawing_a_profitable_account_must_not_report_a_negative_return() {
+        // Deposit 5000, earn 100, withdraw all 5100: net contribution is -100.
+        let emptied = cash_valuation("2027-07-12", Decimal::ZERO, dec!(-100));
+        let m = PerformanceService::calculate_simple_performance(&emptied, None, None);
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+        assert!(
+            m.cumulative_return_percent
+                .is_none_or(|p| p >= Decimal::ZERO),
+            "reported {:?} cumulative return on an account that only ever gained",
+            m.cumulative_return_percent
+        );
+    }
+
     /// HOLDINGS mode uses gain-vs-book-basis for all-time. TWR/IRR are returned
     /// as `None` because they aren't meaningful without per-transaction
     /// cash-flow tracking.

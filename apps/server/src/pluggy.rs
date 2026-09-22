@@ -2668,4 +2668,72 @@ mod tests {
             Some(ITEM_UNAVAILABLE)
         );
     }
+
+    /// OPEN DEFECT (Opus review): the snapshot guard protects the *write*, not the
+    /// *state*. `sync_inner` assigns `st.investments = merge_investments(&st.investments,
+    /// investments)` (pluggy.rs:1390) where `investments` only accumulated positions from
+    /// items whose `/investments` call succeeded this run. A failed item therefore has all
+    /// of its positions pruned out of the persisted state (`save_state` runs
+    /// unconditionally, pluggy.rs:1224). On the next successful run `old` no longer
+    /// contains them, so `merge_investments` takes the bootstrap arm and re-derives cost
+    /// basis from Pluggy's `amountOriginal` — discarding a tracked basis that had
+    /// deliberately diverged from it. That is the exact reset
+    /// `account_migration_cost_basis_reset_would_manufacture_phantom_gain_without_this_guard`
+    /// exists to prevent, reachable through nothing worse than one HTTP timeout.
+    #[test]
+    #[ignore = "documents an open defect: a transient /investments failure prunes the item's positions from pluggy_state.json, so the next success re-bootstraps cost basis from amountOriginal"]
+    fn a_transient_investments_failure_must_not_discard_tracked_cost_basis() {
+        // Same shape as the production anomaly: tracked basis deliberately above
+        // Pluggy's own `amountOriginal`.
+        let mut tracked = inv("btg-cdb", Some(140975.19), Some(1.0));
+        tracked.amount_original = Some(88000.0);
+        tracked.cost_basis = Some(128143.98);
+        tracked.cost_origin = Some("BOOTSTRAP".into());
+
+        // Run N+1: `/investments` times out, so nothing is collected for this item.
+        let after_failure = merge_investments(std::slice::from_ref(&tracked), vec![]);
+        assert_eq!(
+            after_failure.len(),
+            1,
+            "a fetch failure must not prune the item's positions from state"
+        );
+
+        // Run N+2: the read succeeds again with unchanged figures. No money moved,
+        // so cost basis must be exactly what it was.
+        let mut recovered = inv("btg-cdb", Some(140975.19), Some(1.0));
+        recovered.amount_original = Some(88000.0);
+        let merged = merge_investments(&after_failure, vec![recovered]).remove(0);
+        assert_eq!(
+            merged.cost_basis,
+            Some(128143.98),
+            "recovery re-bootstrapped cost from amountOriginal, manufacturing a 40143.98 gain"
+        );
+    }
+
+    /// OPEN DEFECT (Opus review): `investments_failed` is only populated when `paged`
+    /// returns `Err` (pluggy.rs:1381). An HTTP 200 carrying an empty `results` array —
+    /// or records whose `balance`/`amount` are null, every field of `PluggyInvestment`
+    /// past `id` being `Option` (pluggy.rs:181) — is indistinguishable from "this item
+    /// genuinely holds nothing". `map_investment` drops such a record at its `value?`
+    /// (pluggy.rs:1041) and the snapshot is written anyway, because the only empty-write
+    /// guard (pluggy.rs:1681) also requires cash to be zero, and an item with a BANK
+    /// account has cash. The position vanishes for a day and returns the next run: a
+    /// fake loss followed by a fake recovery.
+    #[test]
+    #[ignore = "documents an open defect: an HTTP 200 with missing/partial investment data is treated as a real wipe, not as an incomplete read"]
+    fn a_partial_investments_payload_must_not_read_as_a_real_wipe() {
+        let mut tracked = inv("btg-cdb", Some(140975.19), Some(1.0));
+        tracked.amount_original = Some(88000.0);
+        tracked.cost_basis = Some(128143.98);
+
+        // Pluggy answers 200 but the record has no value yet (mid-refresh).
+        let mut partial = inv("btg-cdb", None, Some(1.0));
+        partial.amount_original = Some(88000.0);
+        let merged = merge_investments(std::slice::from_ref(&tracked), vec![partial]).remove(0);
+
+        assert!(
+            map_investment(&merged, ValueBasis::Net).is_some(),
+            "a valueless payload silently removed a position worth 140975.19 from the snapshot"
+        );
+    }
 }
