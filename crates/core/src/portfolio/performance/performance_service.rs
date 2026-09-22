@@ -11094,6 +11094,100 @@ mod tests {
         assert_eq!(attribution_pnl(&bridged_result).round_dp(2), dec!(302.19));
     }
 
+    /// BV, Mercado Pago and Mercado Pago 2 golden proofs through the same real
+    /// `compute_account_performance` dashboard path as the BTG test above, using
+    /// each account's real (anonymized) prior book_basis / cash / raw cost_basis
+    /// figures from the `bridge_snapshot_continuity` tests in
+    /// `manual_snapshot_service.rs`. Unlike BTG (whose real 3-day-later market
+    /// value is on record), these three have no recorded post-link market value,
+    /// so day2's investment_market_value is set to each account's own true prior
+    /// book_basis - i.e. "no real return happened yet, only the provider
+    /// migration" - which is the cleanest, most direct way to isolate whether the
+    /// migration event itself manufactures a gain.
+    #[test]
+    fn account_migration_golden_proofs_for_bv_and_mercado_pago_accounts() {
+        fn migration_gain(
+            prior_total_value: Decimal,
+            day2_market_value: Decimal,
+            day2_cost_basis: Decimal,
+        ) -> Decimal {
+            let day1 = valuation(
+                "2026-09-18",
+                prior_total_value,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            );
+            // total_value is unused by the dated-period gain formula this test
+            // exercises (confirmed above: it reads investment_market_value and
+            // cost_basis only), so it's set to day2_market_value here as a
+            // placeholder rather than a claim about the account's real cash.
+            let day2 = valuation(
+                "2026-09-21",
+                day2_market_value,
+                Decimal::ZERO,
+                day2_market_value,
+                day2_cost_basis,
+            );
+            let result = PerformanceService::compute_account_performance(
+                &[day1, day2],
+                Some(TrackingMode::Holdings),
+                Some(date("2026-09-18")),
+                false,
+            )
+            .expect("holdings period should compute");
+            attribution_pnl(&result).round_dp(2)
+        }
+
+        // BV: prior book_basis 71,446.00 (cash 71,446.00, cost_basis 0), Pluggy's
+        // raw reported cost_basis 70,000.00 (cash_new = 0, unaffected by this
+        // fix's new fallback branch - cash never exceeds prior book_basis here).
+        assert_eq!(
+            migration_gain(dec!(71446.00), dec!(71446.00), dec!(70000.00)),
+            dec!(1446.00),
+            "BV pre-fix (raw, unbridged cost_basis): the 1,446.00 book_basis gap reads as gain"
+        );
+        assert_eq!(
+            migration_gain(dec!(71446.00), dec!(71446.00), dec!(71446.00)),
+            Decimal::ZERO,
+            "BV fixed (bridged cost_basis): the migration itself manufactures no gain"
+        );
+
+        // Mercado Pago: prior book_basis 6,120.00, but post-link cash (7,254.30)
+        // alone exceeds it - the exact case this fix's fallback branch covers.
+        // Pre-this-fix (the floor-at-zero bug), cost_basis collapsed to 0 and the
+        // Caixinha's entire raw cost (4,457.07) leaked through as gain - worse
+        // than the original, un-bridged defect.
+        assert_eq!(
+            migration_gain(dec!(6120.00), dec!(4457.07), Decimal::ZERO),
+            dec!(4457.07),
+            "Mercado Pago floor-at-zero bug: the whole position value reads as gain"
+        );
+        assert_eq!(
+            migration_gain(dec!(6120.00), dec!(4457.07), dec!(4457.07)),
+            Decimal::ZERO,
+            "Mercado Pago fixed (raw cost_basis fallback): the migration itself manufactures no gain"
+        );
+
+        // Mercado Pago 2: prior book_basis 4,693.11417426 (cash_new = 0, also
+        // unaffected by this fix's new fallback branch), raw reported cost_basis
+        // 4,329.98.
+        assert_eq!(
+            migration_gain(dec!(4693.11417426), dec!(4693.11417426), dec!(4329.98)),
+            dec!(363.13),
+            "Mercado Pago 2 pre-fix (raw, unbridged cost_basis): the book_basis gap reads as gain"
+        );
+        assert_eq!(
+            migration_gain(
+                dec!(4693.11417426),
+                dec!(4693.11417426),
+                dec!(4693.11417426)
+            ),
+            Decimal::ZERO,
+            "Mercado Pago 2 fixed (bridged cost_basis): the migration itself manufactures no gain"
+        );
+    }
+
     /// SOL REVIEW: the `net_contribution == 0` fallback misfires on a real
     /// TRANSACTIONS account whose deposits and withdrawals happen to net to
     /// exactly zero. Deposit 5000, earn 100 into cash, then withdraw exactly

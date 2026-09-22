@@ -112,22 +112,30 @@ fn bridge_snapshot_continuity(
     // never re-fires - ordinary position-level cost tracking takes over from here.
     if prior.cost_basis.is_zero() && !raw_total_cost_basis.is_zero() {
         let prior_book_basis = prior.cost_basis + prior.cash_total_account_currency;
-        let bridged_cost_basis =
-            (prior_book_basis - cash_total_account_currency).max(Decimal::ZERO);
-        let scale = bridged_cost_basis / raw_total_cost_basis;
-        for position in positions.values_mut() {
-            position.average_cost = (position.average_cost * scale).round_dp(DECIMAL_PRECISION);
-            position.total_cost_basis =
-                (position.total_cost_basis * scale).round_dp(DECIMAL_PRECISION);
+        // Only bridge when there is a non-negative leftover of the prior book
+        // basis to allocate to cost basis after honoring this write's own cash
+        // total. When cash alone already accounts for (or exceeds) the entire
+        // prior book basis, there is nothing left to bridge from - flooring the
+        // shortfall at zero would scale every position's cost basis to zero,
+        // making its whole market value read as fabricated gain (worse than not
+        // bridging at all). Trust the write's own raw cost basis, unscaled.
+        if cash_total_account_currency < prior_book_basis {
+            let bridged_cost_basis = prior_book_basis - cash_total_account_currency;
+            let scale = bridged_cost_basis / raw_total_cost_basis;
+            for position in positions.values_mut() {
+                position.average_cost = (position.average_cost * scale).round_dp(DECIMAL_PRECISION);
+                position.total_cost_basis =
+                    (position.total_cost_basis * scale).round_dp(DECIMAL_PRECISION);
+            }
+            // Sum the now-rounded positions rather than using `bridged_cost_basis`
+            // directly, so the account-level total always matches what the
+            // positions themselves actually add up to.
+            total_cost_basis = positions
+                .values()
+                .map(|p| p.total_cost_basis)
+                .sum::<Decimal>()
+                .round_dp(DECIMAL_PRECISION);
         }
-        // Sum the now-rounded positions rather than using `bridged_cost_basis`
-        // directly, so the account-level total always matches what the positions
-        // themselves actually add up to.
-        total_cost_basis = positions
-            .values()
-            .map(|p| p.total_cost_basis)
-            .sum::<Decimal>()
-            .round_dp(DECIMAL_PRECISION);
     }
 
     (
@@ -570,10 +578,12 @@ mod tests {
 
     /// Mercado Pago's real shape: a Caixinha position (cost 4457.06) plus a tiny
     /// residual position (cost 0.01), cash staying nonzero at 7254.30 (unlike
-    /// BTG/BV, MP kept some cash outside the Caixinha). Prior net_contribution
-    /// 4129.02420329 on a prior book_basis of 6120.00 (cost 0 + cash 6120.00).
+    /// BTG/BV, MP kept some cash outside the Caixinha) - and unlike BTG/BV,
+    /// that cash alone already exceeds the prior book_basis. Prior
+    /// net_contribution 4129.02420329 on a prior book_basis of 6120.00 (cost
+    /// 0 + cash 6120.00).
     #[test]
-    fn mercado_pago_bridges_with_residual_cash_after_link() {
+    fn mercado_pago_falls_back_to_raw_cost_basis_when_cash_exceeds_prior_book_basis() {
         let prior = prior_snapshot(Decimal::ZERO, dec!(6120.00), dec!(4129.02420329));
         let mut pos = positions(&[
             ("caixinha", dec!(1), dec!(4457.06)),
@@ -587,10 +597,15 @@ mod tests {
             bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, new_cash);
 
         assert_eq!(nc, dec!(4129.02420329));
-        // Bridged cost basis: prior book_basis (6120.00) minus the cash this
-        // write reports (7254.30) - here cash alone already exceeds the prior
-        // book_basis, so the bridge floors at zero rather than going negative.
-        assert_eq!(cb, Decimal::ZERO);
+        // Cash alone (7254.30) already exceeds the prior book_basis (6120.00):
+        // there is no non-negative leftover to bridge. Flooring cost_basis at
+        // zero here would scale every position's cost to zero, making the
+        // Caixinha's entire market value read as fabricated gain - worse than
+        // not bridging at all. Fall back to the write's own raw cost basis,
+        // unscaled.
+        assert_eq!(cb, dec!(4457.07));
+        assert_eq!(pos["caixinha"].total_cost_basis, dec!(4457.06)); // unscaled
+        assert_eq!(pos["residual"].total_cost_basis, dec!(0.01)); // unscaled
     }
 
     /// Mercado Pago 2's real shape: a single Caixinha position, all cash
