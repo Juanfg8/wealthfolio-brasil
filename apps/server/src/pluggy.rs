@@ -90,6 +90,20 @@ struct Page<T> {
     total_pages: u32,
 }
 
+const PAGE_SIZE: u32 = 500;
+
+/// Whether `paged` needs to fetch another page. `total_pages` of 0 means the field
+/// was missing from the response entirely (`#[serde(default)]`) - that must never be
+/// read as "this is the only page", or a response that simply omits `totalPages`
+/// silently truncates every list to its first `PAGE_SIZE` rows. A page that came back
+/// full is treated as possibly incomplete regardless of what `total_pages` says.
+fn has_more_pages(page: u32, results_on_page: usize, total_pages: u32) -> bool {
+    if total_pages > 0 {
+        return page < total_pages;
+    }
+    results_on_page as u32 >= PAGE_SIZE
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluggyAccount {
@@ -1222,10 +1236,12 @@ impl Client {
         loop {
             let mut q = base.to_vec();
             q.push(("page", page.to_string()));
-            q.push(("pageSize", "500".into()));
+            q.push(("pageSize", PAGE_SIZE.to_string()));
             let p: Page<T> = self.get(path, &q).await?;
+            let results_on_page = p.results.len();
+            let total_pages = p.total_pages;
             out.extend(p.results);
-            if page >= p.total_pages.max(1) {
+            if !has_more_pages(page, results_on_page, total_pages) {
                 return Ok(out);
             }
             page += 1;
@@ -1950,6 +1966,24 @@ pub fn start_scheduler(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_total_pages_falls_back_to_a_full_page_check() {
+        // totalPages omitted entirely (defaults to 0): a full page must be treated
+        // as possibly incomplete, or every list silently truncates to page 1.
+        assert!(has_more_pages(1, PAGE_SIZE as usize, 0));
+        // A page that came back short, with no totalPages either, is the only
+        // reliable "that's everything" signal available in that case.
+        assert!(!has_more_pages(1, 3, 0));
+    }
+
+    #[test]
+    fn present_total_pages_is_still_authoritative() {
+        assert!(has_more_pages(1, PAGE_SIZE as usize, 3));
+        assert!(!has_more_pages(3, PAGE_SIZE as usize, 3));
+        // Even a short final page keeps going while more pages are declared.
+        assert!(has_more_pages(1, 2, 3));
+    }
 
     fn tx(
         id: &str,
