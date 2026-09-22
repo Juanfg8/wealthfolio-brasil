@@ -489,6 +489,15 @@ pub fn match_candidates(
     match_names(&names, existing)
 }
 
+const ITEM_UNAVAILABLE: &str =
+    "Pluggy item unavailable (expired, revoked or unreachable); nothing was written";
+
+/// `GET /items/{id}` yielding neither connector nor update time means Pluggy could not
+/// serve the item (404/expired/revoked/error).
+pub fn item_unavailable(connector: Option<&str>, updated_at: Option<&str>) -> bool {
+    connector.is_none() && updated_at.is_none()
+}
+
 /// MeuPluggy proxies every bank through one connector, so the connector name says
 /// nothing about the institution; label the item after its first account instead.
 pub fn derive_institution(connector: Option<&str>, accounts: &[PluggyAccount]) -> Option<String> {
@@ -1158,8 +1167,19 @@ async fn sync_inner(
 
     // 1. Discover accounts + investments (read-only).
     let mut investments = Vec::new();
+    // Items Pluggy could not read this run (expired, revoked, transient error): never write
+    // anything for them, since their stored balances would be stale.
+    let mut unavailable: HashSet<String> = HashSet::new();
     for item_id in &cfg.item_ids {
         let (connector, item_updated_at) = client.item_meta(item_id).await;
+        if item_unavailable(connector.as_deref(), item_updated_at.as_deref()) {
+            warn!("Pluggy item unavailable; writes for it are skipped this run");
+            unavailable.insert(item_id.clone());
+            if let Some(l) = st.items.get_mut(item_id) {
+                l.last_error = Some(ITEM_UNAVAILABLE.into());
+            }
+            continue;
+        }
         let accounts: Vec<PluggyAccount> = client
             .paged("/accounts", &[("itemId", item_id.clone())])
             .await?;
@@ -1311,6 +1331,10 @@ async fn sync_inner(
         .filter(|a| a.status == LinkStatus::Linked)
     {
         acc.last_error = None;
+        if unavailable.contains(&acc.item_id) {
+            acc.last_error = Some(ITEM_UNAVAILABLE.into());
+            continue;
+        }
         let is_card = acc.kind == "CREDIT";
         if acc.kind != "BANK" && !is_card {
             acc.last_error = Some(format!("unsupported account kind {}", acc.kind));
@@ -1464,10 +1488,11 @@ async fn sync_inner(
         .values_mut()
         .filter(|a| a.kind == "BANK" && !a.reserves.is_empty())
     {
-        if !st
-            .items
-            .get(&acc.item_id)
-            .is_some_and(|l| l.status == LinkStatus::Linked)
+        if unavailable.contains(&acc.item_id)
+            || !st
+                .items
+                .get(&acc.item_id)
+                .is_some_and(|l| l.status == LinkStatus::Linked)
         {
             continue;
         }
@@ -1518,6 +1543,10 @@ async fn sync_inner(
         .values_mut()
         .filter(|l| l.status == LinkStatus::Linked)
     {
+        if unavailable.contains(&link.item_id) {
+            link.last_error = Some(ITEM_UNAVAILABLE.into());
+            continue;
+        }
         let Some(wf_id) = link.linked_account_id.clone() else {
             continue;
         };
@@ -2445,5 +2474,14 @@ mod tests {
         assert!(models_history(&other));
         other.indexer = Some("SELIC".into());
         assert!(!models_history(&other));
+    }
+    #[test]
+    fn an_item_pluggy_cannot_serve_is_flagged_unavailable() {
+        assert!(item_unavailable(None, None)); // 404 / expired / revoked / network error
+        assert!(!item_unavailable(
+            Some("MeuPluggy"),
+            Some("2026-09-21T22:06:42.745Z")
+        ));
+        assert!(!item_unavailable(Some("MeuPluggy"), None));
     }
 }
