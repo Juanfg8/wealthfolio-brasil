@@ -63,8 +63,14 @@ RUN mkdir -p apps/server/src && \
 # Cache mounts persist the registry download and compiled dependency
 # artifacts across builds, independent of Docker layer invalidation (unlike
 # the layer cache, a cache mount survives even when an earlier COPY's content
-# changes). This is what actually saves time on a source-only change: without
-# it, every rebuild recompiles the whole dependency graph from scratch.
+# changes) -- but only within the SAME BuildKit builder instance (e.g. local
+# iterative `docker build`/`docker buildx build`). They do NOT help our GHA
+# workflow as configured: ubuntu-latest runners are a fresh VM per run with a
+# brand-new builder, and `cache-to/cache-from: type=gha` exports/imports only
+# the layer cache, not named cache-mount contents. So on CI these mounts
+# start empty every run; closing that gap needs an explicit cache-mount
+# export/import step (e.g. reproducible-containers/buildkit-cache-dance)
+# in .github/workflows/docker-publish-ghcr.yml, which is not yet wired up.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETPLATFORM \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-$TARGETPLATFORM \
     --mount=type=cache,target=/app/target,id=cargo-target-$TARGETPLATFORM \
@@ -77,7 +83,8 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 ENV OPENSSL_STATIC=1
 ENV CARGO_BUILD_JOBS=2
 # Build using xx-cargo which handles target flags. Same cache mounts as the
-# fetch step above, so dependency builds carry over between images.
+# fetch step above, so dependency builds carry over between images built by
+# the same builder instance (see the note above: not our GHA CI as configured).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETPLATFORM \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-$TARGETPLATFORM \
     --mount=type=cache,target=/app/target,id=cargo-target-$TARGETPLATFORM \
