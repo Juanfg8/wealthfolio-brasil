@@ -10907,6 +10907,53 @@ mod tests {
         assert_eq!(yield_metrics.cumulative_return_percent, Some(dec!(0.02)));
     }
 
+    /// KNOWN DEFECT (not yet fixed — needs a design decision, see night-shift report):
+    /// `book_basis` is `cost_basis(positions) + cash`, recomputed fresh from each day's
+    /// snapshot with no memory of *why* cash changed. For a pure-cash account (no priced
+    /// position, so `cost_basis` is always zero) `book_basis` degenerates to exactly the
+    /// cash balance — which always equals `total_value` for such an account, so gain is
+    /// always zero, even when real interest was credited straight into that cash balance.
+    /// The golden water-tank scenario (deposit 5000, earn 100 interest into cash) must
+    /// show a 100 gain; it currently shows zero. This cannot be fixed by branching on
+    /// "is there a position" alone (see `simple_performance_uses_book_basis_instead_of_net_contribution`'s
+    /// transfer case just above, which legitimately needs book_basis == cash == 10000 for
+    /// a *different* zero-position account). The real fix is to track book_basis
+    /// incrementally through activity classification (like `net_contribution`, but at
+    /// `PerformanceScope::Account` so transfers count as external too) instead of
+    /// recomputing it from the snapshot every day.
+    #[test]
+    #[ignore = "documents an open defect: cash-credited yield reads as zero gain via book_basis; needs incremental account-scoped basis tracking, not a quick patch here"]
+    fn cash_only_account_interest_must_not_read_as_zero_gain() {
+        let mut after_deposit = valuation(
+            "2026-06-12",
+            dec!(5000),
+            dec!(5000),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        after_deposit.book_basis = dec!(5000); // cost_basis(0) + cash(5000): matches deposit here
+
+        let mut after_interest = valuation(
+            "2026-06-19",
+            dec!(5100), // interest credited straight into cash
+            dec!(5000), // net_contribution unchanged: INTEREST never affects it
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        // What `valuation_calculator::calculate_valuation_with_price_factors` actually
+        // produces: cost_basis(0) + cash(5100). It cannot tell this 100 apart from a
+        // contribution, because at the snapshot level it is just "cash".
+        after_interest.book_basis = dec!(5100);
+
+        let metrics = PerformanceService::calculate_simple_performance(
+            &after_interest,
+            Some(&after_deposit),
+            Some(dec!(5100)),
+        );
+        assert_eq!(metrics.total_gain_loss_amount, Some(dec!(100)));
+        assert_eq!(metrics.cumulative_return_percent, Some(dec!(0.02)));
+    }
+
     /// HOLDINGS mode uses gain-vs-book-basis for all-time. TWR/IRR are returned
     /// as `None` because they aren't meaningful without per-transaction
     /// cash-flow tracking.
