@@ -10899,7 +10899,12 @@ mod tests {
     }
 
     #[test]
-    fn simple_performance_uses_book_basis_instead_of_net_contribution() {
+    fn simple_performance_falls_back_to_book_basis_when_net_contribution_is_zero() {
+        // Not a real account-scoped transfer: production's `handle_transfer_in` credits
+        // `net_contribution` for those (see `sol_account_scoped_transfer_in_is_flow_
+        // neutral_via_net_contribution` below), so a transfer never actually reaches
+        // this fallback. This is the HOLDINGS-mode/Pluggy shape the fallback exists
+        // for: net_contribution structurally zero, book_basis carrying the real basis.
         let mut current = valuation(
             "2026-06-19",
             dec!(10000),
@@ -10908,10 +10913,16 @@ mod tests {
             Decimal::ZERO,
         );
         current.book_basis = dec!(10000);
-        let transfer =
+        let zero_net_contribution_fallback =
             PerformanceService::calculate_simple_performance(&current, None, Some(dec!(10000)));
-        assert_eq!(transfer.total_gain_loss_amount, Some(Decimal::ZERO));
-        assert_eq!(transfer.cumulative_return_percent, Some(Decimal::ZERO));
+        assert_eq!(
+            zero_net_contribution_fallback.total_gain_loss_amount,
+            Some(Decimal::ZERO)
+        );
+        assert_eq!(
+            zero_net_contribution_fallback.cumulative_return_percent,
+            Some(Decimal::ZERO)
+        );
 
         current.total_value = dec!(5100);
         current.investment_market_value = dec!(5100);
