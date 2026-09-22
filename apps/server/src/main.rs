@@ -117,9 +117,41 @@ async fn main() -> anyhow::Result<()> {
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await;
     result?;
     Ok(())
+}
+
+/// Waits for SIGTERM (Railway's stop signal) or Ctrl+C. `with_graceful_shutdown` then
+/// stops accepting new connections and lets in-flight HTTP requests finish instead of
+/// cutting them off mid-response. This does not by itself drain the SQLite writer
+/// actor - a request already past its DB write is unaffected either way, since WAL
+/// makes an individual write atomic, but a long-running operation with more writes
+/// still queued behind it could still be interrupted. Draining the writer actor too
+/// would need `AppState` to expose it here, which it does not today.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("Shutdown signal received; finishing in-flight requests...");
 }
 
 #[cfg(test)]
