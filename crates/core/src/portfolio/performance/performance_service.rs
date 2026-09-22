@@ -11016,6 +11016,109 @@ mod tests {
         assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
     }
 
+    /// SOL REVIEW: the `net_contribution == 0` fallback misfires on a real
+    /// TRANSACTIONS account whose deposits and withdrawals happen to net to
+    /// exactly zero. Deposit 5000, earn 100 into cash, then withdraw exactly
+    /// the 5000 principal (a round-number withdrawal - very reachable): the
+    /// 100 earned is still sitting in the account, but net_contribution is
+    /// 0, so the basis falls back to book_basis (= cash = 100) and the gain
+    /// reads zero. Resolving it needs the account's TrackingMode at this seam
+    /// (no field on DailyAccountValuation distinguishes the two populations),
+    /// which is a signature change through PerformanceServiceTrait and both
+    /// app layers - out of scope for a review patch.
+    #[test]
+    #[ignore = "documents an open defect: net_contribution == 0 is ambiguous between HOLDINGS-mode (never tracked) and a TRANSACTIONS account whose flows netted to zero; needs TrackingMode threaded into calculate_simple_performance"]
+    fn sol_zero_net_contribution_transactions_account_still_reports_earned_yield() {
+        let mut after_principal_withdrawal = valuation(
+            "2026-06-26",
+            dec!(100), // only the earned interest is left
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        after_principal_withdrawal.book_basis = dec!(100); // cost_basis(0) + cash(100)
+
+        let m = PerformanceService::calculate_simple_performance(
+            &after_principal_withdrawal,
+            None,
+            None,
+        );
+        // 5000 in, 5000 out, 100 still there => lifetime gain is +100.
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+    }
+
+    /// SOL REVIEW: the same defect seen as a discontinuity. Withdrawing 4999,
+    /// 5000 or 5001 of principal are economically adjacent - the lifetime gain
+    /// is +100 in all three - but the basis rule jumps to a different formula
+    /// at exactly 5000, producing 100 / 0 / 100.
+    #[test]
+    #[ignore = "documents an open defect: same root cause as sol_zero_net_contribution_transactions_account_still_reports_earned_yield"]
+    fn sol_gain_is_continuous_across_the_net_contribution_zero_boundary() {
+        // (withdrawn, net_contribution, remaining cash)
+        let cases = [
+            (dec!(4999), dec!(1), dec!(101)),
+            (dec!(5000), Decimal::ZERO, dec!(100)),
+            (dec!(5001), dec!(-1), dec!(99)),
+        ];
+        for (withdrawn, net_contribution, cash) in cases {
+            let mut v = valuation(
+                "2026-06-26",
+                cash,
+                net_contribution,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            );
+            v.book_basis = cash; // cost_basis(0) + cash
+            let m = PerformanceService::calculate_simple_performance(&v, None, None);
+            assert_eq!(
+                m.total_gain_loss_amount,
+                Some(dec!(100)),
+                "withdrawing {} of a 5000 principal that earned 100 must still show +100",
+                withdrawn
+            );
+        }
+    }
+
+    /// SOL REVIEW (pre-existing, not caused by this fix): after a full
+    /// withdrawal that takes out more than was ever put in, `net_contribution`
+    /// goes negative and becomes a negative denominator, so a genuinely
+    /// profitable account reports a positive gain with a negative percent.
+    #[test]
+    fn sol_full_withdrawal_negative_net_contribution_percent_sign() {
+        let mut emptied = valuation(
+            "2026-06-26",
+            Decimal::ZERO, // everything withdrawn
+            dec!(-100),    // 5000 in, 5100 out
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        emptied.book_basis = Decimal::ZERO;
+        let m = PerformanceService::calculate_simple_performance(&emptied, None, None);
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+        assert_eq!(m.cumulative_return_percent, Some(dec!(-1)));
+    }
+
+    /// SOL REVIEW: the account-scoped transfer case the old `book_basis`
+    /// comment claimed needed book_basis. Production's `handle_transfer_in`
+    /// *does* increment `net_contribution` (transfers are external at account
+    /// scope), so a transfer-funded account has a nonzero net_contribution and
+    /// never reaches the fallback at all.
+    #[test]
+    fn sol_account_scoped_transfer_in_is_flow_neutral_via_net_contribution() {
+        let mut received = valuation(
+            "2026-06-26",
+            dec!(10000),
+            dec!(10000), // handle_transfer_in credited net_contribution
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        received.book_basis = dec!(10000);
+        let m =
+            PerformanceService::calculate_simple_performance(&received, None, Some(dec!(10000)));
+        assert_eq!(m.total_gain_loss_amount, Some(Decimal::ZERO));
+        assert_eq!(m.cumulative_return_percent, Some(Decimal::ZERO));
+    }
+
     /// HOLDINGS mode uses gain-vs-book-basis for all-time. TWR/IRR are returned
     /// as `None` because they aren't meaningful without per-transaction
     /// cash-flow tracking.
