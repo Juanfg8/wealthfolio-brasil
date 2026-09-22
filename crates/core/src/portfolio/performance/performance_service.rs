@@ -11030,6 +11030,70 @@ mod tests {
         assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
     }
 
+    /// Real-data audit golden test (BTG's real shape, anonymized): a HOLDINGS-mode
+    /// account held R$140,673.00 in cash on day 1 (correctly, this is what
+    /// `compute_account_performance` sees for a pure-cash day: investment_market_
+    /// value=0, cost_basis=0). Getting linked to Pluggy converted the entire
+    /// balance into investment positions. Before the account-migration fix
+    /// (`bridge_snapshot_continuity` in `manual_snapshot_service.rs`), the new
+    /// snapshot's cost_basis was Pluggy's raw reported figure (131,138.23) -
+    /// this test proves what the dashboard's real period-delta formula
+    /// (`investment_market_value - cost_basis`) does with that, both before and
+    /// after the fix, using the actual production magnitudes.
+    #[test]
+    fn account_migration_no_longer_manufactures_a_period_gain_on_the_dashboard_path() {
+        let day1 = valuation(
+            "2026-09-18",
+            dec!(140673.00),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+
+        // Unbridged (pre-fix) shape: cost_basis is Pluggy's raw amountOriginal-
+        // derived figure, unrelated to the account's true prior book_basis.
+        let day2_unbridged = valuation(
+            "2026-09-21",
+            dec!(140975.19),
+            Decimal::ZERO,
+            dec!(140975.19),
+            dec!(131138.2252141),
+        );
+        let unbridged_result = PerformanceService::compute_account_performance(
+            &[day1.clone(), day2_unbridged],
+            Some(TrackingMode::Holdings),
+            Some(date("2026-09-18")),
+            false,
+        )
+        .expect("holdings period should compute");
+        // This is the bug as it shipped: a ~9,837 fabricated gain in 3 days on an
+        // account that only actually earned a few hundred reais of real interest.
+        assert_eq!(
+            attribution_pnl(&unbridged_result).round_dp(2),
+            dec!(9836.96)
+        );
+
+        // Bridged (post-fix) shape: cost_basis is set so book_basis (cost_basis +
+        // cash, here cash=0) equals the account's true prior book_basis
+        // (140,673.00), exactly what bridge_snapshot_continuity now produces.
+        let day2_bridged = valuation(
+            "2026-09-21",
+            dec!(140975.19),
+            Decimal::ZERO,
+            dec!(140975.19),
+            dec!(140673.00),
+        );
+        let bridged_result = PerformanceService::compute_account_performance(
+            &[day1, day2_bridged],
+            Some(TrackingMode::Holdings),
+            Some(date("2026-09-18")),
+            false,
+        )
+        .expect("holdings period should compute");
+        // Only the real 3-day value change remains - small, plausible, not fabricated.
+        assert_eq!(attribution_pnl(&bridged_result).round_dp(2), dec!(302.19));
+    }
+
     /// SOL REVIEW: the `net_contribution == 0` fallback misfires on a real
     /// TRANSACTIONS account whose deposits and withdrawals happen to net to
     /// exactly zero. Deposit 5000, earn 100 into cash, then withdraw exactly

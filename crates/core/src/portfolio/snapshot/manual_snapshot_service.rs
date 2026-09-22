@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::assets::{AssetKind, AssetMetadata, AssetServiceTrait, InstrumentType, QuoteMode};
+use crate::constants::DECIMAL_PRECISION;
 use crate::errors::Result;
 use crate::fx::FxServiceTrait;
 use crate::portfolio::snapshot::{
@@ -67,6 +68,73 @@ pub struct ManualSnapshotService {
     snapshot_service: Arc<dyn SnapshotServiceTrait>,
     quote_service: Arc<dyn QuoteServiceTrait>,
     timezone: String,
+}
+
+/// A manual snapshot write (Pluggy sync or hand entry alike) reports the account's
+/// *current* state; it carries no information about what, if anything, actually
+/// flowed in or out since the last snapshot. Trusting it blindly breaks two ways:
+///
+/// 1. `net_contribution` would reset to zero even when this account has real,
+///    activity-tracked contribution history - the account this write is for may
+///    have been tracked through ordinary DEPOSIT/WITHDRAWAL/TRANSFER activities
+///    for months before it started receiving snapshot writes at all (e.g. a
+///    manual account later linked to Pluggy).
+/// 2. The first time a position appears where the account previously held only
+///    cash, whatever cost basis this write reports (Pluggy's own `amountOriginal`,
+///    or a fresh manual entry) gets read as the account's entire investment gain
+///    in that single instant, regardless of how long the money had actually been
+///    there before this write started tracking it as "invested".
+///
+/// Bridges both against the account's own last known state (`prior`) instead of
+/// assuming either "no history" (case 1) or "trust this write completely" (case
+/// 2). Mutates `positions` in place, scaling every position's cost proportionally
+/// so their sum matches the bridged total exactly. Returns
+/// `(net_contribution, net_contribution_base, cost_basis)` for the new snapshot.
+fn bridge_snapshot_continuity(
+    prior: Option<&AccountStateSnapshot>,
+    positions: &mut HashMap<String, Position>,
+    raw_total_cost_basis: Decimal,
+    cash_total_account_currency: Decimal,
+) -> (Decimal, Decimal, Decimal) {
+    let Some(prior) = prior else {
+        // No prior snapshot at all: a genuinely new account. Zero contribution and
+        // whatever this first write reports as cost are both correct as-is.
+        return (Decimal::ZERO, Decimal::ZERO, raw_total_cost_basis);
+    };
+
+    let mut total_cost_basis = raw_total_cost_basis;
+
+    // A position appearing where the account previously tracked zero cost basis
+    // (pure cash, or genuinely no snapshot history yet) is the migration moment:
+    // bridge cost basis so book_basis (cost_basis + cash) is preserved across it,
+    // rather than reading the write's own cost figures as this instant's gain.
+    // Once bridged, prior.cost_basis is nonzero on every later write, so this
+    // never re-fires - ordinary position-level cost tracking takes over from here.
+    if prior.cost_basis.is_zero() && !raw_total_cost_basis.is_zero() {
+        let prior_book_basis = prior.cost_basis + prior.cash_total_account_currency;
+        let bridged_cost_basis =
+            (prior_book_basis - cash_total_account_currency).max(Decimal::ZERO);
+        let scale = bridged_cost_basis / raw_total_cost_basis;
+        for position in positions.values_mut() {
+            position.average_cost = (position.average_cost * scale).round_dp(DECIMAL_PRECISION);
+            position.total_cost_basis =
+                (position.total_cost_basis * scale).round_dp(DECIMAL_PRECISION);
+        }
+        // Sum the now-rounded positions rather than using `bridged_cost_basis`
+        // directly, so the account-level total always matches what the positions
+        // themselves actually add up to.
+        total_cost_basis = positions
+            .values()
+            .map(|p| p.total_cost_basis)
+            .sum::<Decimal>()
+            .round_dp(DECIMAL_PRECISION);
+    }
+
+    (
+        prior.net_contribution,
+        prior.net_contribution_base,
+        total_cost_basis,
+    )
 }
 
 impl ManualSnapshotService {
@@ -241,7 +309,7 @@ impl ManualSnapshotService {
             }
         }
 
-        let total_cost_basis: Decimal = positions.values().map(|p| p.total_cost_basis).sum();
+        let raw_total_cost_basis: Decimal = positions.values().map(|p| p.total_cost_basis).sum();
 
         // Cache the cash totals on the keyframe: the daily holdings calculator
         // only fills them on CALCULATED snapshots, and the snapshot history UI
@@ -258,6 +326,18 @@ impl ManualSnapshotService {
             None => Decimal::ZERO,
         };
 
+        let prior = self
+            .snapshot_service
+            .get_latest_holdings_snapshot(&request.account_id)
+            .unwrap_or(None);
+        let (net_contribution, net_contribution_base, total_cost_basis) =
+            bridge_snapshot_continuity(
+                prior.as_ref(),
+                &mut positions,
+                raw_total_cost_basis,
+                cash_total_account_currency,
+            );
+
         let snapshot = AccountStateSnapshot {
             id: format!(
                 "{}_{}",
@@ -270,8 +350,8 @@ impl ManualSnapshotService {
             positions,
             cash_balances,
             cost_basis: total_cost_basis,
-            net_contribution: Decimal::ZERO,
-            net_contribution_base: Decimal::ZERO,
+            net_contribution,
+            net_contribution_base,
             cash_total_account_currency,
             cash_total_base_currency,
             calculated_at: Utc::now().naive_utc(),
@@ -369,5 +449,195 @@ impl ManualSnapshotService {
                 debug!("Failed to create quote for asset {}: {}", asset_id, e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn position(asset_id: &str, quantity: Decimal, average_cost: Decimal) -> Position {
+        Position {
+            id: format!("POS-{asset_id}"),
+            account_id: "acct".to_string(),
+            asset_id: asset_id.to_string(),
+            quantity,
+            average_cost,
+            total_cost_basis: quantity * average_cost,
+            currency: "BRL".to_string(),
+            ..Position::default()
+        }
+    }
+
+    fn positions(entries: &[(&str, Decimal, Decimal)]) -> HashMap<String, Position> {
+        entries
+            .iter()
+            .map(|(id, qty, cost)| (id.to_string(), position(id, *qty, *cost)))
+            .collect()
+    }
+
+    fn prior_snapshot(
+        cost_basis: Decimal,
+        cash: Decimal,
+        net_contribution: Decimal,
+    ) -> AccountStateSnapshot {
+        AccountStateSnapshot {
+            cost_basis,
+            net_contribution,
+            net_contribution_base: net_contribution,
+            cash_total_account_currency: cash,
+            ..AccountStateSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn brand_new_account_has_no_prior_and_is_untouched() {
+        let mut pos = positions(&[("cdb", dec!(1), dec!(500))]);
+        let (nc, nc_base, cb) =
+            bridge_snapshot_continuity(None, &mut pos, dec!(500), Decimal::ZERO);
+        assert_eq!(nc, Decimal::ZERO);
+        assert_eq!(nc_base, Decimal::ZERO);
+        assert_eq!(cb, dec!(500));
+        assert_eq!(pos["cdb"].average_cost, dec!(500)); // unscaled
+    }
+
+    /// BTG's real shape (anonymized production numbers, 2026-09-21): a pure-cash
+    /// account with real activity history (net_contribution=136544.37) got linked
+    /// to Pluggy, which reported 7 investment positions summing to cost_basis
+    /// 131138.2252141 and cash dropping to 0. Before this fix, that 131138.23
+    /// vs the account's true 136544.37 book_basis - a ~5406 gap - read as
+    /// instantaneous fabricated gain, on top of losing the 136544.37 itself
+    /// (net_contribution reset to 0 discarded ALL of it, not just the gap).
+    #[test]
+    fn btg_pluggy_link_preserves_net_contribution_and_bridges_cost_basis() {
+        let prior = prior_snapshot(Decimal::ZERO, dec!(140673.00), dec!(136544.36526210));
+        let mut pos = positions(&[
+            ("t1", dec!(5_000_000), dec!(0.01)), // 50,000
+            ("t2", dec!(1_000_000), dec!(0.01)), // 10,000
+            ("t3", dec!(1_000_000), dec!(0.01)), // 10,000
+            ("t4", dec!(1), dec!(1138.2252141)), // 1,138.2252141
+            ("t5", dec!(4_000_000), dec!(0.01)), // 40,000
+            ("t6", dec!(1_000_000), dec!(0.01)), // 10,000
+            ("t7", dec!(1_000_000), dec!(0.01)), // 10,000
+        ]);
+        let raw_total_cost_basis: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+        assert_eq!(raw_total_cost_basis.round_dp(2), dec!(131138.23));
+
+        let (nc, _nc_base, cb) =
+            bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, Decimal::ZERO);
+
+        // net_contribution must survive the link untouched - not reset to zero.
+        assert_eq!(nc, dec!(136544.36526210));
+        // cost_basis is bridged to the prior book_basis (cost 0 + cash 140673.00),
+        // not left at Pluggy's raw 131138.23.
+        // Summing 7 independently-rounded (8dp) positions can accumulate a few
+        // billionths of a real; immaterial at currency precision.
+        assert_eq!(cb.round_dp(2), dec!(140673.00));
+        // Every position was scaled by (approximately) the same ratio - each is
+        // independently rounded to 8dp, so their sum matches at currency precision.
+        let scaled_sum: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+        assert_eq!(scaled_sum.round_dp(2), cb.round_dp(2));
+        // Relative weighting between positions is preserved (at currency precision;
+        // independent per-position rounding can differ by a billionth of a real).
+        assert_eq!(
+            pos["t1"].total_cost_basis.round_dp(2),
+            (pos["t2"].total_cost_basis * dec!(5)).round_dp(2)
+        );
+    }
+
+    /// BV's real shape: 4 positions summing to exactly 70000.00, cash dropping
+    /// to 0, prior net_contribution 69606.97860456 on a prior book_basis of
+    /// 71446.00 (cost 0 + cash 71446.00).
+    #[test]
+    fn bv_pluggy_link_bridges_cost_basis_to_prior_book_basis() {
+        let prior = prior_snapshot(Decimal::ZERO, dec!(71446.00), dec!(69606.97860456));
+        let mut pos = positions(&[
+            ("a", dec!(1_000_000), dec!(0.01)), // 10,000
+            ("b", dec!(1_000_000), dec!(0.01)), // 10,000
+            ("c", dec!(1_965_097), dec!(0.01)), // 19,650.97
+            ("d", dec!(3_034_903), dec!(0.01)), // 30,349.03
+        ]);
+        let raw_total_cost_basis: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+        assert_eq!(raw_total_cost_basis, dec!(70000.00));
+
+        let (nc, _nc_base, cb) =
+            bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, Decimal::ZERO);
+
+        assert_eq!(nc, dec!(69606.97860456));
+        assert_eq!(cb, dec!(71446.00));
+    }
+
+    /// Mercado Pago's real shape: a Caixinha position (cost 4457.06) plus a tiny
+    /// residual position (cost 0.01), cash staying nonzero at 7254.30 (unlike
+    /// BTG/BV, MP kept some cash outside the Caixinha). Prior net_contribution
+    /// 4129.02420329 on a prior book_basis of 6120.00 (cost 0 + cash 6120.00).
+    #[test]
+    fn mercado_pago_bridges_with_residual_cash_after_link() {
+        let prior = prior_snapshot(Decimal::ZERO, dec!(6120.00), dec!(4129.02420329));
+        let mut pos = positions(&[
+            ("caixinha", dec!(1), dec!(4457.06)),
+            ("residual", dec!(1), dec!(0.01)),
+        ]);
+        let raw_total_cost_basis: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+        assert_eq!(raw_total_cost_basis, dec!(4457.07));
+
+        let new_cash = dec!(7254.30); // MP's real post-link cash (not all converted)
+        let (nc, _nc_base, cb) =
+            bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, new_cash);
+
+        assert_eq!(nc, dec!(4129.02420329));
+        // Bridged cost basis: prior book_basis (6120.00) minus the cash this
+        // write reports (7254.30) - here cash alone already exceeds the prior
+        // book_basis, so the bridge floors at zero rather than going negative.
+        assert_eq!(cb, Decimal::ZERO);
+    }
+
+    /// Mercado Pago 2's real shape: a single Caixinha position, all cash
+    /// converted (cash=0 after link, unlike Mercado Pago).
+    #[test]
+    fn mercado_pago_2_single_position_bridges_cleanly() {
+        let prior = prior_snapshot(Decimal::ZERO, dec!(4693.11417426), dec!(4693.11417426));
+        let mut pos = positions(&[("caixinha2", dec!(1), dec!(4329.98))]);
+        let raw_total_cost_basis: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+
+        let (nc, _nc_base, cb) =
+            bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, Decimal::ZERO);
+
+        assert_eq!(nc, dec!(4693.11417426));
+        assert_eq!(cb, dec!(4693.11417426));
+        assert_eq!(pos["caixinha2"].total_cost_basis, cb); // single position takes it all
+    }
+
+    /// Once bridged, prior.cost_basis is nonzero, so a later resync must not
+    /// re-bridge - ordinary position-level cost tracking (already handled
+    /// elsewhere) takes over, and this function becomes a pure net_contribution
+    /// carry-forward with cost_basis passed through unchanged.
+    #[test]
+    fn already_bridged_account_does_not_re_bridge_on_next_sync() {
+        let prior = prior_snapshot(dec!(140673.00), Decimal::ZERO, dec!(136544.36526210));
+        let mut pos = positions(&[("t1", dec!(1), dec!(140975.19))]); // a later day's real value
+        let raw_total_cost_basis: Decimal = pos.values().map(|p| p.total_cost_basis).sum();
+
+        let (nc, _nc_base, cb) =
+            bridge_snapshot_continuity(Some(&prior), &mut pos, raw_total_cost_basis, Decimal::ZERO);
+
+        assert_eq!(nc, dec!(136544.36526210));
+        assert_eq!(cb, dec!(140975.19)); // passed through, not re-bridged
+        assert_eq!(pos["t1"].average_cost, dec!(140975.19)); // unscaled
+    }
+
+    /// A manual (non-Pluggy) account with no prior investment position and no
+    /// prior activity history at all behaves exactly as before this fix: zero
+    /// contribution, cost basis taken as-is. Existing correct manual accounts
+    /// must not regress.
+    #[test]
+    fn manual_account_with_no_prior_snapshot_and_no_positions_is_unaffected() {
+        let mut pos: HashMap<String, Position> = HashMap::new();
+        let (nc, nc_base, cb) =
+            bridge_snapshot_continuity(None, &mut pos, Decimal::ZERO, dec!(1000.00));
+        assert_eq!(nc, Decimal::ZERO);
+        assert_eq!(nc_base, Decimal::ZERO);
+        assert_eq!(cb, Decimal::ZERO);
     }
 }

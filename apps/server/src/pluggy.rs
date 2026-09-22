@@ -1036,9 +1036,18 @@ async fn fetch_cdi(
 /// shows the modeled lifetime yield instead of zero: cost = observed - modeled yield. The
 /// observed value stays authoritative; whatever separates it from the model (withdrawals,
 /// principal moves) lands in cost, so it is neither return nor a portfolio flow.
+/// Records the modeled historical yield as pure metadata only - it no longer
+/// touches `cost_basis`. It used to (`cost_basis = observed - modeled_yield`),
+/// injecting a hardcoded, hindsight-picked amount straight into real performance:
+/// any two Caixinhas that happened to match the same 114-116% CDI band got the
+/// identical modeled gain the instant they were observed, regardless of what
+/// actually happened to either account. `cost_basis` stays at whatever
+/// `apply_reserve_flows`'s bootstrap already set it to (the observed value, zero
+/// apparent gain), matching every other reserve/investment bootstrap in this
+/// file. Callers that want the modeled estimate can read `modeled.modeled_yield`
+/// directly instead of having it silently blended into displayed gain.
 pub fn apply_modeled_history(r: &mut ReserveState, seed: &ModelSeed) {
     let round2 = |v: f64| (v * 100.0).round() / 100.0;
-    r.cost_basis = Some(round2((r.amount - seed.modeled_yield).max(0.0)));
     r.cost_origin = Some("MODELED_HISTORY".into());
     r.modeled = Some(ModeledHistory {
         principal: MODEL_PRINCIPAL,
@@ -2722,7 +2731,15 @@ mod tests {
     }
 
     #[test]
-    fn first_pluggy_observation_keeps_modeled_yield_and_pluggy_value() {
+    fn first_pluggy_observation_records_modeled_yield_as_metadata_only() {
+        // FIXED (real-data audit found this): the modeled yield used to be
+        // subtracted straight out of cost_basis, so Mercado Pago and Mercado
+        // Pago 2 - both qualifying for the exact same hardcoded 115%-CDI
+        // constant - showed the identical fabricated gain the instant either
+        // was observed, regardless of either account's real history. Cost
+        // basis now stays at the bootstrap's observed value (zero apparent
+        // gain, same as every other reserve/investment); the model is
+        // recorded for anyone who wants to see the estimate explicitly.
         let sd = seed();
         let mut r = pocket(4881.22); // observed BELOW 5,000 is allowed: Pluggy wins
         r.indexer = Some("CDI".into());
@@ -2731,8 +2748,8 @@ mod tests {
         apply_modeled_history(&mut r, &sd);
         let (value, perf) = value_and_gain(&r);
         assert_eq!(value, Decimal::new(488122, 2)); // current value stays the Pluggy value
-        assert_eq!(perf, Decimal::new(17250, 2)); // performance starts at the modeled yield, not 0
-        assert_eq!(r.cost_basis, Some(4708.72)); // the gap to the model sits in cost, not in return
+        assert_eq!(perf, Decimal::ZERO); // no fabricated gain at bootstrap
+        assert_eq!(r.cost_basis, Some(4881.22)); // cost = observed value, like any bootstrap
         assert_eq!(r.cost_origin.as_deref(), Some("MODELED_HISTORY"));
         let m = r.modeled.unwrap();
         assert_eq!(
@@ -2740,6 +2757,28 @@ mod tests {
             (5000.0, 115.0, 172.5)
         );
         assert_eq!(m.observed_value, 4881.22);
+    }
+
+    #[test]
+    fn two_caixinhas_qualifying_for_the_same_constant_no_longer_share_a_fabricated_gain() {
+        // Mercado Pago and Mercado Pago 2's real numbers: both qualify for the
+        // same MODEL_RATE_PCT=115 band, but have different observed values and
+        // must not produce the same "gain" merely because they share a constant.
+        let sd = seed();
+        let mut mp = pocket(12262.61);
+        mp.indexer = Some("CDI".into());
+        apply_reserve_flows(&mut mp, &[], "2026-09-21");
+        apply_modeled_history(&mut mp, &sd);
+
+        let mut mp2 = pocket(5345.58);
+        mp2.indexer = Some("CDI".into());
+        apply_reserve_flows(&mut mp2, &[], "2026-09-21");
+        apply_modeled_history(&mut mp2, &sd);
+
+        assert_eq!(value_and_gain(&mp).1, Decimal::ZERO);
+        assert_eq!(value_and_gain(&mp2).1, Decimal::ZERO);
+        // Both still zero, but for the right reason: neither fabricates a gain
+        // at all, not because they coincidentally share one.
     }
 
     #[test]
