@@ -58,5 +58,7 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ env.SHORT_SHA }}
+          build-args: |
+            GIT_SHA=${{ env.SHORT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

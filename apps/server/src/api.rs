@@ -45,6 +45,7 @@ mod database_backups;
 mod device_sync;
 #[cfg(feature = "device-sync")]
 pub(crate) mod device_sync_engine;
+mod diagnostics;
 mod exchange_rates;
 mod goals;
 mod health;
@@ -147,6 +148,7 @@ pub fn app_router(state: Arc<AppState>, config: &Config) -> anyhow::Result<Route
         .merge(settings::router())
         .merge(data_exports::router())
         .merge(database_backups::router())
+        .merge(diagnostics::router())
         .merge(portfolio::router())
         .merge(holdings::router())
         .merge(performance::router())

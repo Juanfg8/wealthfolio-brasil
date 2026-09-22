@@ -93,6 +93,10 @@ WORKDIR /app
 COPY --from=backend /wealthfolio-server /usr/local/bin/wealthfolio-server
 COPY --from=frontend /web-dist ./dist
 ENV WF_DB_PATH=/data/wealthfolio.db
+# Git SHA of the commit this image was built from (passed by CI); read at
+# runtime by GET /api/v1/diagnostics/summary to answer "what's actually running".
+ARG GIT_SHA=
+ENV WF_GIT_SHA=${GIT_SHA}
 # Wealthfolio Connect API URL (can be overridden at runtime via -e or docker-compose)
 ARG CONNECT_API_URL=
 ENV CONNECT_API_URL=${CONNECT_API_URL}
