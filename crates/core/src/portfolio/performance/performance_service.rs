@@ -5194,12 +5194,25 @@ impl PerformanceService {
         _previous: Option<&DailyAccountValuation>,
         total_portfolio_value_base: Option<Decimal>,
     ) -> SimplePerformanceMetrics {
-        // Cash is part of current value, but it is not investment return.
-        // `book_basis` includes cash principal plus investment cost basis, so
-        // this remains flow-neutral for transfers, reconciliation changes and
-        // ordinary cash movements while preserving investment yield.
-        let total_gain_loss_amount = current.total_value - current.book_basis;
-        let denominator_cumulative_return = current.book_basis;
+        // `net_contribution` is incrementally tracked through activity
+        // classification (DEPOSIT/WITHDRAWAL move it, INTEREST/DIVIDEND never
+        // do), so it correctly excludes cash-credited yield from principal.
+        // `book_basis` (cost basis of positions + cash) is recomputed fresh
+        // from the snapshot every day with no memory of *why* cash changed,
+        // so it cannot tell a contribution apart from yield paid into cash -
+        // but it is the only signal available for HOLDINGS-mode accounts,
+        // which never update net_contribution at all (Pluggy/snapshot-driven
+        // accounts carry no transaction-level flow history). A nonzero
+        // net_contribution is what distinguishes "this account is tracked
+        // through activities" from "net_contribution is structurally always
+        // zero here", so it is the safer basis whenever it is available.
+        let basis = if current.net_contribution.is_zero() {
+            current.book_basis
+        } else {
+            current.net_contribution
+        };
+        let total_gain_loss_amount = current.total_value - basis;
+        let denominator_cumulative_return = basis;
         let cumulative_return_percent = if !denominator_cumulative_return.is_zero() {
             Some((total_gain_loss_amount / denominator_cumulative_return).round_dp(4))
         } else if total_gain_loss_amount.is_zero() {
@@ -10907,22 +10920,16 @@ mod tests {
         assert_eq!(yield_metrics.cumulative_return_percent, Some(dec!(0.02)));
     }
 
-    /// KNOWN DEFECT (not yet fixed — needs a design decision, see night-shift report):
-    /// `book_basis` is `cost_basis(positions) + cash`, recomputed fresh from each day's
-    /// snapshot with no memory of *why* cash changed. For a pure-cash account (no priced
-    /// position, so `cost_basis` is always zero) `book_basis` degenerates to exactly the
-    /// cash balance — which always equals `total_value` for such an account, so gain is
-    /// always zero, even when real interest was credited straight into that cash balance.
-    /// The golden water-tank scenario (deposit 5000, earn 100 interest into cash) must
-    /// show a 100 gain; it currently shows zero. This cannot be fixed by branching on
-    /// "is there a position" alone (see `simple_performance_uses_book_basis_instead_of_net_contribution`'s
-    /// transfer case just above, which legitimately needs book_basis == cash == 10000 for
-    /// a *different* zero-position account). The real fix is to track book_basis
-    /// incrementally through activity classification (like `net_contribution`, but at
-    /// `PerformanceScope::Account` so transfers count as external too) instead of
-    /// recomputing it from the snapshot every day.
+    /// `book_basis` (`cost_basis(positions) + cash`, recomputed fresh from each day's
+    /// snapshot with no memory of *why* cash changed) cannot tell a contribution apart
+    /// from interest credited straight into cash — both are just "cash" at the snapshot
+    /// level. `net_contribution` can: it is tracked incrementally through activity
+    /// classification (DEPOSIT/WITHDRAWAL move it, INTEREST never does), so it is the
+    /// correct basis whenever it is actually being tracked. `calculate_simple_performance`
+    /// now prefers it and only falls back to `book_basis` when `net_contribution` is zero
+    /// (HOLDINGS-mode/Pluggy accounts never update it at all, so zero there means "not
+    /// tracked", not "genuinely no capital in this account").
     #[test]
-    #[ignore = "documents an open defect: cash-credited yield reads as zero gain via book_basis; needs incremental account-scoped basis tracking, not a quick patch here"]
     fn cash_only_account_interest_must_not_read_as_zero_gain() {
         let mut after_deposit = valuation(
             "2026-06-12",
@@ -10952,6 +10959,61 @@ mod tests {
         );
         assert_eq!(metrics.total_gain_loss_amount, Some(dec!(100)));
         assert_eq!(metrics.cumulative_return_percent, Some(dec!(0.02)));
+    }
+
+    /// The water-tank golden scenario: deposit, earn, withdraw the earnings, deposit
+    /// again, then a provider reconciliation confirming the same balance. External
+    /// capital (deposits/withdrawals) must never read as return; only the 100 actually
+    /// earned may, and it must survive being withdrawn and a later, larger deposit.
+    #[test]
+    fn golden_water_tank_scenario_deposit_earn_withdraw_deposit_reconcile() {
+        fn cash_valuation(
+            total_value: Decimal,
+            net_contribution: Decimal,
+        ) -> DailyAccountValuation {
+            let mut v = valuation(
+                "2026-06-12",
+                total_value,
+                net_contribution,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            );
+            v.book_basis = total_value; // cost_basis(0) + cash: what production actually computes
+            v
+        }
+
+        // 1. Deposit 5000: value 5000, return 0.
+        let after_deposit = cash_valuation(dec!(5000), dec!(5000));
+        let m = PerformanceService::calculate_simple_performance(&after_deposit, None, None);
+        assert_eq!(m.total_value, Some(dec!(5000)));
+        assert_eq!(m.total_gain_loss_amount, Some(Decimal::ZERO));
+
+        // 2. Earn 100: value 5100, return +100.
+        let after_yield = cash_valuation(dec!(5100), dec!(5000));
+        let m = PerformanceService::calculate_simple_performance(&after_yield, None, None);
+        assert_eq!(m.total_value, Some(dec!(5100)));
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+
+        // 3. Withdraw exactly the 100 earned: value back to 5000, but the realized
+        // return must still show +100 - the withdrawal must not erase it.
+        let after_withdrawal = cash_valuation(dec!(5000), dec!(4900));
+        let m = PerformanceService::calculate_simple_performance(&after_withdrawal, None, None);
+        assert_eq!(m.total_value, Some(dec!(5000)));
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+
+        // 4. Deposit another 5000: value 10000, historical return still +100 - the new
+        // capital must not be counted as, or dilute, the earlier gain.
+        let after_second_deposit = cash_valuation(dec!(10000), dec!(9900));
+        let m = PerformanceService::calculate_simple_performance(&after_second_deposit, None, None);
+        assert_eq!(m.total_value, Some(dec!(10000)));
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
+
+        // 5. Provider reconciliation confirms the same balance (no real flow, no real
+        // yield) - must not manufacture additional return.
+        let after_reconciliation = cash_valuation(dec!(10000), dec!(9900));
+        let m = PerformanceService::calculate_simple_performance(&after_reconciliation, None, None);
+        assert_eq!(m.total_value, Some(dec!(10000)));
+        assert_eq!(m.total_gain_loss_amount, Some(dec!(100)));
     }
 
     /// HOLDINGS mode uses gain-vs-book-basis for all-time. TWR/IRR are returned

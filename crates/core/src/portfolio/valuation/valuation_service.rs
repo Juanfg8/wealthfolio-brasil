@@ -4231,10 +4231,25 @@ mod tests {
         let end = date("2026-06-06");
         let mut first = snapshot_with_position("2026-06-01", "AAPL", dec!(10));
         first.source = SnapshotSource::ManualEntry;
-        // Mid-period: buy 10 more shares and deposit 300 cash.
+        // `snapshot_with_position` hardcodes a $10 placeholder cost basis that
+        // predates cost-basis-aware holdings performance; give the position a
+        // realistic acquisition cost (bought at the day-1 quote, so day 1
+        // itself carries no gain) so this test measures what it claims to.
+        {
+            let position = first.positions.get_mut("AAPL").unwrap();
+            position.average_cost = dec!(100);
+            position.total_cost_basis = dec!(1000);
+        }
+        // Mid-period: buy 10 more shares (at the day-4 quote, ~102) and
+        // deposit 300 cash.
         let mut second = snapshot_with_position("2026-06-04", "AAPL", dec!(20));
         second.source = SnapshotSource::ManualEntry;
         second.cash_balances = HashMap::from([("USD".to_string(), dec!(300))]);
+        {
+            let position = second.positions.get_mut("AAPL").unwrap();
+            position.average_cost = dec!(101); // (10 x 100 + 10 x 102) / 20
+            position.total_cost_basis = dec!(2020);
+        }
         let timeline = HoldingsTimeline::new(Some(start), end, vec![first, second], None, false);
         let account = holdings_prepared_account(timeline);
 
