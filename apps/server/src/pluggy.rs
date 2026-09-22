@@ -544,23 +544,55 @@ pub fn item_unavailable(connector: Option<&str>, updated_at: Option<&str>) -> bo
 
 const INVESTMENTS_INCOMPLETE: &str =
     "Pluggy investments unavailable this run; snapshot not written to avoid dropping positions";
+const INVESTMENTS_WIPED: &str =
+    "Pluggy investments read as empty for an item that previously had positions; snapshot not written to avoid a false wipe";
 
 /// Whether a linked item's investment snapshot must be skipped this run, and why. An
 /// item whose `/investments` call failed is reachable but incomplete: `st.investments`
 /// will simply be missing its positions, so writing a snapshot anyway would report a
 /// spurious drop in value today and a spurious recovery once the read next succeeds.
+/// The same is true of a *successful* call that comes back suspiciously empty.
 pub fn item_snapshot_block_reason(
     item_id: &str,
     unavailable: &HashSet<String>,
     investments_failed: &HashSet<String>,
+    investments_wiped: &HashSet<String>,
 ) -> Option<&'static str> {
     if unavailable.contains(item_id) {
         Some(ITEM_UNAVAILABLE)
     } else if investments_failed.contains(item_id) {
         Some(INVESTMENTS_INCOMPLETE)
+    } else if investments_wiped.contains(item_id) {
+        Some(INVESTMENTS_WIPED)
     } else {
         None
     }
+}
+
+/// Items whose /investments call returned `Ok` this run (so `investments_failed` does
+/// not already cover them) but came back with zero rows for an item that previously
+/// had at least one active, tracked position. An empty `results` array, or every row
+/// missing its value (every field past `id` on `PluggyInvestment` is optional), both
+/// deserialize as a plain success - this is the only way to tell a genuine "this item
+/// now holds nothing" apart from a degraded/partial read.
+pub fn items_with_a_suspicious_investment_wipe(
+    old: &[InvestmentState],
+    fresh: &[InvestmentState],
+    investments_queried_ok: &HashSet<String>,
+) -> HashSet<String> {
+    let old_items_with_positions: HashSet<&str> = old
+        .iter()
+        .filter(|i| i.status.as_deref().unwrap_or("ACTIVE") == "ACTIVE")
+        .map(|i| i.item_id.as_str())
+        .collect();
+    let fresh_items: HashSet<&str> = fresh.iter().map(|i| i.item_id.as_str()).collect();
+    old_items_with_positions
+        .into_iter()
+        .filter(|item_id| {
+            investments_queried_ok.contains(*item_id) && !fresh_items.contains(item_id)
+        })
+        .map(String::from)
+        .collect()
 }
 
 /// MeuPluggy proxies every bank through one connector, so the connector name says
@@ -1243,6 +1275,10 @@ async fn sync_inner(
     // reachable: `st.investments` will be missing this item's positions below, so its
     // snapshot must be skipped rather than written without them (see step 3).
     let mut investments_failed: HashSet<String> = HashSet::new();
+    // Items whose /investments call returned Ok this run, regardless of how many rows
+    // it contained - distinct from investments_failed (which only covers a hard Err).
+    // Needed to tell "queried, got zero rows back" apart from "never queried".
+    let mut investments_queried_ok: HashSet<String> = HashSet::new();
     for item_id in &cfg.item_ids {
         let (connector, item_updated_at) = client.item_meta(item_id).await;
         if item_unavailable(connector.as_deref(), item_updated_at.as_deref()) {
@@ -1353,31 +1389,34 @@ async fn sync_inner(
             .paged::<PluggyInvestment>("/investments", &[("itemId", item_id.clone())])
             .await
         {
-            Ok(list) => investments.extend(list.into_iter().map(|i| InvestmentState {
-                id: i.id,
-                item_id: item_id.clone(),
-                kind: i.kind,
-                subtype: i.subtype,
-                name: i.name,
-                code: i.code,
-                balance: i.balance,
-                quantity: i.quantity,
-                currency: i.currency_code,
-                gross_amount: i.amount,
-                taxes: match (i.taxes, i.taxes2) {
-                    (None, None) => None,
-                    (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
-                },
-                rate: i.rate,
-                rate_type: i.rate_type,
-                fixed_annual_rate: i.fixed_annual_rate,
-                status: i.status,
-                amount_original: i.amount_original,
-                cost_basis: None,
-                cost_origin: None,
-                due_date: i.due_date.map(|d| d.chars().take(10).collect()),
-                issuer: i.issuer,
-            })),
+            Ok(list) => {
+                investments_queried_ok.insert(item_id.clone());
+                investments.extend(list.into_iter().map(|i| InvestmentState {
+                    id: i.id,
+                    item_id: item_id.clone(),
+                    kind: i.kind,
+                    subtype: i.subtype,
+                    name: i.name,
+                    code: i.code,
+                    balance: i.balance,
+                    quantity: i.quantity,
+                    currency: i.currency_code,
+                    gross_amount: i.amount,
+                    taxes: match (i.taxes, i.taxes2) {
+                        (None, None) => None,
+                        (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+                    },
+                    rate: i.rate,
+                    rate_type: i.rate_type,
+                    fixed_annual_rate: i.fixed_annual_rate,
+                    status: i.status,
+                    amount_original: i.amount_original,
+                    cost_basis: None,
+                    cost_origin: None,
+                    due_date: i.due_date.map(|d| d.chars().take(10).collect()),
+                    issuer: i.issuer,
+                }));
+            }
             Err(e) => {
                 warn!("Pluggy investments unavailable for an item: {e}");
                 investments_failed.insert(item_id.clone());
@@ -1387,6 +1426,16 @@ async fn sync_inner(
             }
         }
     }
+    // A successful /investments call that comes back empty (or with only inactive
+    // rows) for an item that previously had tracked positions is indistinguishable at
+    // the HTTP layer from "this item genuinely holds nothing now" - an empty `results`
+    // array, or every row missing its value, both deserialize as Ok. Treat it with the
+    // same suspicion as a hard fetch error rather than silently writing a wipe.
+    let investments_wiped = items_with_a_suspicious_investment_wipe(
+        &st.investments,
+        &investments,
+        &investments_queried_ok,
+    );
     st.investments = merge_investments(&st.investments, investments);
     summary.accounts_seen = st.accounts.len();
     summary.needs_review = st
@@ -1618,9 +1667,12 @@ async fn sync_inner(
         .values_mut()
         .filter(|l| l.status == LinkStatus::Linked)
     {
-        if let Some(reason) =
-            item_snapshot_block_reason(&link.item_id, &unavailable, &investments_failed)
-        {
+        if let Some(reason) = item_snapshot_block_reason(
+            &link.item_id,
+            &unavailable,
+            &investments_failed,
+            &investments_wiped,
+        ) {
             link.last_error = Some(reason.into());
             continue;
         }
@@ -2643,14 +2695,25 @@ mod tests {
         let unavailable: HashSet<String> = HashSet::new();
         let mut investments_failed: HashSet<String> = HashSet::new();
         investments_failed.insert("item-1".into());
+        let investments_wiped: HashSet<String> = HashSet::new();
 
         assert_eq!(
-            item_snapshot_block_reason("item-1", &unavailable, &investments_failed),
+            item_snapshot_block_reason(
+                "item-1",
+                &unavailable,
+                &investments_failed,
+                &investments_wiped
+            ),
             Some(INVESTMENTS_INCOMPLETE)
         );
         // An unrelated item with readable investments is unaffected.
         assert_eq!(
-            item_snapshot_block_reason("item-2", &unavailable, &investments_failed),
+            item_snapshot_block_reason(
+                "item-2",
+                &unavailable,
+                &investments_failed,
+                &investments_wiped
+            ),
             None
         );
     }
@@ -2661,11 +2724,60 @@ mod tests {
         unavailable.insert("item-1".into());
         let mut investments_failed: HashSet<String> = HashSet::new();
         investments_failed.insert("item-1".into());
+        let investments_wiped: HashSet<String> = HashSet::new();
 
         assert_eq!(
-            item_snapshot_block_reason("item-1", &unavailable, &investments_failed),
+            item_snapshot_block_reason(
+                "item-1",
+                &unavailable,
+                &investments_failed,
+                &investments_wiped
+            ),
             Some(ITEM_UNAVAILABLE)
         );
+    }
+
+    #[test]
+    fn a_suspiciously_empty_read_for_a_previously_tracked_item_blocks_the_snapshot() {
+        let unavailable: HashSet<String> = HashSet::new();
+        let investments_failed: HashSet<String> = HashSet::new();
+        let mut investments_wiped: HashSet<String> = HashSet::new();
+        investments_wiped.insert("item-1".into());
+
+        assert_eq!(
+            item_snapshot_block_reason(
+                "item-1",
+                &unavailable,
+                &investments_failed,
+                &investments_wiped
+            ),
+            Some(INVESTMENTS_WIPED)
+        );
+    }
+
+    #[test]
+    fn detects_an_item_that_queried_ok_but_lost_all_its_previously_tracked_positions() {
+        let old = vec![inv("btg-cdb", Some(140975.19), Some(1.0))];
+        let mut queried_ok: HashSet<String> = HashSet::new();
+        queried_ok.insert("item".into());
+
+        // Queried successfully, came back with zero rows: suspicious.
+        let wiped = items_with_a_suspicious_investment_wipe(&old, &[], &queried_ok);
+        assert!(wiped.contains("item"));
+
+        // Never queried at all this run (e.g. a hard fetch error already handled by
+        // investments_failed): not flagged here, to avoid double-blocking.
+        let not_queried = items_with_a_suspicious_investment_wipe(&old, &[], &HashSet::new());
+        assert!(not_queried.is_empty());
+
+        // Queried successfully and the position is still there: not flagged.
+        let fresh = vec![inv("btg-cdb", Some(150000.0), Some(1.0))];
+        let still_there = items_with_a_suspicious_investment_wipe(&old, &fresh, &queried_ok);
+        assert!(still_there.is_empty());
+
+        // Nothing was ever tracked for this item before: an empty read is unremarkable.
+        let no_prior_history = items_with_a_suspicious_investment_wipe(&[], &[], &queried_ok);
+        assert!(no_prior_history.is_empty());
     }
 
     /// OPEN DEFECT (Opus review): the snapshot guard protects the *write*, not the
