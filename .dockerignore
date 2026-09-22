@@ -27,6 +27,17 @@ playwright-report
 db
 tmp
 
+# Local database snapshots and working data at the repository root. The
+# frontend stage does `COPY . .`, so without these the operator's real
+# portfolio lands in a build layer. Root-anchored on purpose: test fixtures
+# under crates/ are still needed by the build.
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.xlsx
+backups
+
 # OS/editor files
 .DS_Store
 Thumbs.db
