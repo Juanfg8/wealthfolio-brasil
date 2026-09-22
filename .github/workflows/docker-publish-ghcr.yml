@@ -13,7 +13,28 @@ env:
   IMAGE: ghcr.io/juanfg8/wealthfolio-brasil
 
 jobs:
+  # Direct pushes to main (and workflow_dispatch) skip pr-check.yml's rust-check job
+  # entirely, since that job only triggers on pull_request. This is the gap that let
+  # a financial-correctness regression (b012cd310) ship to production undetected on
+  # 2026-09-21: the water-tank invariant tests that would have caught it already
+  # existed and were already red, but nothing in the push-to-main path ran them.
+  # This job is deliberately narrow and fast (the two crates that hold the
+  # performance engine and the Pluggy sync, not the full workspace/clippy/fmt/mobile
+  # suite pr-check.yml already covers for PRs) so it gates every image build without
+  # becoming the slow bureaucracy the project explicitly wants to avoid.
+  financial-regression-gate:
+    name: Financial regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Performance engine and Pluggy sync tests
+        run: cargo test --locked -p wealthfolio-core -p wealthfolio-server --lib
+
   publish:
+    needs: financial-regression-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
