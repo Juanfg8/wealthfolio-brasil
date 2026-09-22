@@ -370,9 +370,20 @@ pub struct InvestmentState {
     /// ACTIVE | TOTAL_WITHDRAWAL | PENDING; only ACTIVE positions are written.
     #[serde(default)]
     pub status: Option<String>,
-    /// Original invested amount (cost); recorded for review, not yet used as cost basis.
+    /// Pluggy's own reported original invested amount, refetched every sync. Never applied
+    /// as cost basis directly (see `cost_basis`): at first bootstrap it may not reflect the
+    /// position's true Wealthfolio contribution history, so it is used only to detect a
+    /// *change* since the last sync.
     #[serde(default)]
     pub amount_original: Option<f64>,
+    /// Tracked principal, independent of `amount_original`. Bootstraps once from the first
+    /// observed `amount_original` (or falls back like `average_cost` does), then only moves
+    /// by the change in `amount_original` between syncs, so a resync alone never resets it.
+    #[serde(default)]
+    pub cost_basis: Option<f64>,
+    /// How `cost_basis` was established. `BOOTSTRAP` = first observation.
+    #[serde(default)]
+    pub cost_origin: Option<String>,
     #[serde(default)]
     pub due_date: Option<String>,
     #[serde(default)]
@@ -390,6 +401,35 @@ pub struct InvestmentState {
     pub rate_type: Option<String>,
     #[serde(default)]
     pub fixed_annual_rate: Option<f64>,
+}
+
+/// Fresh Pluggy investments replace market data (`balance`, `quantity`, `grossAmount`, ...),
+/// but cost basis is tracked independently: it only moves by the change in Pluggy's own
+/// `amountOriginal` since the last sync, so a resync — or an account being freshly linked to
+/// an existing Pluggy investment record — never silently resets an already-tracked cost.
+pub fn merge_investments(
+    old: &[InvestmentState],
+    fresh: Vec<InvestmentState>,
+) -> Vec<InvestmentState> {
+    fresh
+        .into_iter()
+        .map(|mut n| match old.iter().find(|o| o.id == n.id) {
+            Some(o) if o.cost_basis.is_some() => {
+                let delta = match (n.amount_original, o.amount_original) {
+                    (Some(new_v), Some(old_v)) => new_v - old_v,
+                    _ => 0.0,
+                };
+                n.cost_basis = Some(o.cost_basis.unwrap_or(0.0) + delta);
+                n.cost_origin = o.cost_origin.clone();
+                n
+            }
+            _ => {
+                n.cost_basis = n.amount_original;
+                n.cost_origin = Some("BOOTSTRAP".into());
+                n
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -983,9 +1023,13 @@ pub fn map_investment(i: &InvestmentState, basis: ValueBasis) -> Option<ManualHo
         .filter(|q| *q > Decimal::ZERO)
         .unwrap_or(Decimal::ONE);
     let unit_price = (balance / quantity).round_dp(10);
-    // Cost basis is the original invested amount when Pluggy provides it.
+    // Cost basis is the tracked principal (see `cost_basis`), bootstrapped once and only
+    // moved by a change Pluggy itself reports afterward. Falls back to the raw
+    // `amountOriginal` when a caller hasn't run `merge_investments` yet (e.g. a first,
+    // unmerged sync), and finally to the observed value when Pluggy gives no cost at all.
     let average_cost = i
-        .amount_original
+        .cost_basis
+        .or(i.amount_original)
         .and_then(Decimal::from_f64_retain)
         .filter(|c| *c > Decimal::ZERO)
         .map(|c| (c / quantity).round_dp(10))
@@ -1300,6 +1344,8 @@ async fn sync_inner(
                 fixed_annual_rate: i.fixed_annual_rate,
                 status: i.status,
                 amount_original: i.amount_original,
+                cost_basis: None,
+                cost_origin: None,
                 due_date: i.due_date.map(|d| d.chars().take(10).collect()),
                 issuer: i.issuer,
             })),
@@ -1311,7 +1357,7 @@ async fn sync_inner(
             }
         }
     }
-    st.investments = investments;
+    st.investments = merge_investments(&st.investments, investments);
     summary.accounts_seen = st.accounts.len();
     summary.needs_review = st
         .accounts
@@ -1912,6 +1958,8 @@ mod tests {
             currency: Some("BRL".into()),
             status: Some("ACTIVE".into()),
             amount_original: None,
+            cost_basis: None,
+            cost_origin: None,
             due_date: None,
             issuer: None,
             gross_amount: None,
@@ -2036,6 +2084,70 @@ mod tests {
     fn missing_original_amount_falls_back_to_current_price_as_cost() {
         let h = map_net(&inv("x", Some(200.0), Some(4.0))).unwrap();
         assert_eq!(Some(h.average_cost), h.unit_price);
+    }
+
+    #[test]
+    fn first_sync_bootstraps_investment_cost_basis_from_amount_original() {
+        let mut fresh = inv("cdb", Some(10494.21), Some(1_000_000.0));
+        fresh.amount_original = Some(10000.0);
+        let merged = merge_investments(&[], vec![fresh]).remove(0);
+        assert_eq!(merged.cost_basis, Some(10000.0));
+        assert_eq!(merged.cost_origin.as_deref(), Some("BOOTSTRAP"));
+    }
+
+    #[test]
+    fn resync_does_not_reset_investment_cost_basis_when_amount_original_is_unchanged() {
+        // Value grew from real yield (10494.21 -> 10600.00); Pluggy still reports the same
+        // original principal. A naive re-map from `amount_original` alone would be harmless
+        // here, but this guards the carry-forward path a real cost-basis reset would break.
+        let mut old = inv("cdb", Some(10494.21), Some(1_000_000.0));
+        old.amount_original = Some(10000.0);
+        old.cost_basis = Some(10000.0);
+        old.cost_origin = Some("BOOTSTRAP".into());
+        let mut fresh = inv("cdb", Some(10600.00), Some(1_000_000.0));
+        fresh.amount_original = Some(10000.0);
+        let merged = merge_investments(&[old], vec![fresh]).remove(0);
+        assert_eq!(merged.cost_basis, Some(10000.0));
+        assert_eq!(merged.cost_origin.as_deref(), Some("BOOTSTRAP"));
+    }
+
+    #[test]
+    fn investment_cost_basis_moves_by_reported_change_not_absolute_value() {
+        // A genuine top-up: Pluggy now reports a higher original amount. Cost basis moves
+        // by the delta (5000), not to the raw new figure re-applied on top of drift.
+        let mut old = inv("cdb", Some(10494.21), Some(1_000_000.0));
+        old.amount_original = Some(10000.0);
+        old.cost_basis = Some(10000.0);
+        old.cost_origin = Some("BOOTSTRAP".into());
+        let mut fresh = inv("cdb", Some(15600.00), Some(1_000_000.0));
+        fresh.amount_original = Some(15000.0);
+        let merged = merge_investments(&[old], vec![fresh]).remove(0);
+        assert_eq!(merged.cost_basis, Some(15000.0));
+    }
+
+    #[test]
+    fn account_migration_cost_basis_reset_would_manufacture_phantom_gain_without_this_guard() {
+        // Reproduces the shape of the production anomaly: an investment already tracked
+        // in Wealthfolio (e.g. a manual fixed-income account later linked to Pluggy) gets
+        // resynced and Pluggy's `amountOriginal` for the same id doesn't match what was
+        // already recorded (it only reflects Pluggy's own view of the current title, not
+        // Wealthfolio's full contribution history). Without carry-forward, remapping from
+        // `amount_original` directly would silently lower cost and manufacture a gain equal
+        // to the gap, even though no money moved and no yield was earned that day.
+        let mut old = inv("btg-cdb", Some(140975.19), Some(1.0));
+        old.amount_original = Some(88000.0); // Pluggy's own figure at first link
+        old.cost_basis = Some(128143.98); // Wealthfolio's true prior book basis, preserved
+        old.cost_origin = Some("BOOTSTRAP".into());
+        let mut fresh = inv("btg-cdb", Some(140975.19), Some(1.0));
+        fresh.amount_original = Some(88000.0); // unchanged on resync: no real flow happened
+        let merged = merge_investments(&[old], vec![fresh]).remove(0);
+        let h = map_investment(&merged, ValueBasis::Net).unwrap();
+        // Cost basis stays at the true prior figure; value is unchanged; gain is zero.
+        assert_eq!(h.average_cost, Decimal::new(12814398, 2));
+        assert_eq!(
+            h.average_cost,
+            h.unit_price.unwrap() - Decimal::new(1283121, 2)
+        );
     }
 
     fn card_tx(id: &str, kind: &str, amount: f64, status: &str) -> PluggyTransaction {
