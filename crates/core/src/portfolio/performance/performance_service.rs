@@ -900,6 +900,39 @@ impl PerformanceService {
         }
     }
 
+    /// True when `curr` is the first point at which positions enter a holdings
+    /// account that previously tracked none (e.g. a manual cash account linked
+    /// to Pluggy). The unrealized figure the positions arrive with is the
+    /// provider's opening book, not a return earned that day.
+    fn is_position_tracking_bootstrap(
+        prev: &DailyAccountValuation,
+        curr: &DailyAccountValuation,
+    ) -> bool {
+        prev.investment_market_value_base.is_zero()
+            && prev.cost_basis_base.is_zero()
+            && !(curr.investment_market_value_base.is_zero() && curr.cost_basis_base.is_zero())
+    }
+
+    /// Change in holdings unrealized gain (`investment_market_value -
+    /// cost_basis`) across `history`, excluding position-tracking bootstrap
+    /// transitions. Equal to the end-minus-start difference whenever no
+    /// bootstrap occurs inside the window.
+    fn holdings_unrealized_change(
+        history: &[DailyAccountValuation],
+        flow_basis: ExternalFlowBasis,
+    ) -> Decimal {
+        history
+            .windows(2)
+            .filter(|w| !Self::is_position_tracking_bootstrap(&w[0], &w[1]))
+            .map(|w| {
+                (Self::return_investment_market_value(&w[1], flow_basis)
+                    - Self::return_cost_basis(&w[1], flow_basis))
+                    - (Self::return_investment_market_value(&w[0], flow_basis)
+                        - Self::return_cost_basis(&w[0], flow_basis))
+            })
+            .sum()
+    }
+
     fn holdings_basis_is_complete(point: &DailyAccountValuation) -> bool {
         matches!(
             point.basis_status,
@@ -1695,12 +1728,21 @@ impl PerformanceService {
             ExternalFlowBasis::BaseCurrency,
             baseline,
         );
-        // Income-only holdings scopes (cash / fixed income): snapshot value moves
-        // and transfer legs land on different days, so value-derived returns
-        // absorb capital flows. Report income over average capital instead.
+        // Holdings scopes with booked income/realized P&L (cash / fixed income,
+        // or a linked account mixing booked interest with positions): snapshot
+        // value moves and transfer legs land on different days, so value-derived
+        // returns absorb capital flows, and the chained position return ignores
+        // booked income. Report the displayed P&L over the period's average
+        // capital so percent and amount share one numerator and one period.
+        // Pure market-movement scopes keep the chained return (== chart).
+        let attribution = &result.attribution;
+        let has_non_market_pnl = !attribution.income.is_zero()
+            || !attribution.fees.is_zero()
+            || !attribution.taxes.is_zero()
+            || !attribution.realized_pnl.is_zero();
         if result.is_holdings_mode
             && result.period.start_date.is_some()
-            && result.attribution.unrealized_pnl_change.is_zero()
+            && (attribution.unrealized_pnl_change.is_zero() || has_non_market_pnl)
             && !history.is_empty()
         {
             let average_value = history
@@ -1710,10 +1752,7 @@ impl PerformanceService {
                 / Decimal::from(history.len());
             if average_value > Decimal::ZERO {
                 result.returns.value_return = Some(
-                    ((result.attribution.income
-                        - result.attribution.fees
-                        - result.attribution.taxes)
-                        / average_value)
+                    (Self::attribution_pnl(&result.attribution) / average_value)
                         .round_dp(DECIMAL_PRECISION),
                 );
             }
@@ -1921,6 +1960,7 @@ impl PerformanceService {
             start_date,
             end_date,
             baseline,
+            result.is_holdings_mode,
         );
         if !attribution.complete {
             return AttributionEffectSet {
@@ -2825,16 +2865,13 @@ impl PerformanceService {
 
         let end_value = Self::return_total_value(end_point, flow_basis);
         let delta_total_value = if result.is_holdings_mode {
-            let start_gain = if matches!(baseline, AttributionBaseline::Inception) {
-                Decimal::ZERO
-            } else {
-                Self::return_investment_market_value(start_point, flow_basis)
-                    - Self::return_cost_basis(start_point, flow_basis)
-            };
-            (Self::return_investment_market_value(end_point, flow_basis)
-                - Self::return_cost_basis(end_point, flow_basis)
-                - start_gain)
+            if matches!(baseline, AttributionBaseline::Inception) {
+                (Self::return_investment_market_value(end_point, flow_basis)
+                    - Self::return_cost_basis(end_point, flow_basis))
                 .round_dp(DECIMAL_PRECISION)
+            } else {
+                Self::holdings_unrealized_change(history, flow_basis).round_dp(DECIMAL_PRECISION)
+            }
         } else {
             Self::attribution_total_value_delta(start_point, end_point, flow_basis, baseline)
         };
@@ -2864,12 +2901,13 @@ impl PerformanceService {
     ///   the percentage undefined, so the return is omitted rather than
     ///   reported as 0%.
     fn compute_holdings_value_return(
-        start_point: &DailyAccountValuation,
-        end_point: &DailyAccountValuation,
+        history: &[DailyAccountValuation],
         daily_flows: &[DailyExternalFlow],
         is_all_time: bool,
         flow_basis: ExternalFlowBasis,
     ) -> (Option<Decimal>, Option<Decimal>) {
+        let start_point = history.first().expect("holdings history is non-empty");
+        let end_point = history.last().expect("holdings history is non-empty");
         if is_all_time {
             let end_book_basis = Self::return_book_basis(end_point, flow_basis);
             if end_book_basis <= Decimal::ZERO || !Self::holdings_basis_is_complete(end_point) {
@@ -2889,10 +2927,9 @@ impl PerformanceService {
         // Compare investment gain over cost basis instead of total account
         // value: cash deposits, withdrawals and reconciliation adjustments
         // remain neutral even when they occur between snapshots.
-        let gain_change = (Self::return_investment_market_value(end_point, flow_basis)
-            - Self::return_cost_basis(end_point, flow_basis))
-            - (Self::return_investment_market_value(start_point, flow_basis)
-                - Self::return_cost_basis(start_point, flow_basis));
+        // A position-tracking bootstrap (positions first appearing, e.g. a
+        // Pluggy link) is a migration event, never return.
+        let gain_change = Self::holdings_unrealized_change(history, flow_basis);
         // If a position is fully withdrawn, its unrealized gain disappears
         // with the position. Preserve that realized return through the
         // explicit withdrawal flow instead of reporting it as a loss.
@@ -2982,6 +3019,7 @@ impl PerformanceService {
         start_date: NaiveDate,
         end_date: NaiveDate,
         baseline: AttributionBaseline,
+        exclude_position_bootstrap: bool,
     ) -> ScopedUnrealizedAttribution {
         let mut unrealized_pnl_change = Decimal::ZERO;
         let mut fx_effect = Decimal::ZERO;
@@ -3028,10 +3066,31 @@ impl PerformanceService {
                 start_point.map_or(Decimal::ZERO, Self::account_unrealized_local);
             let start_unrealized_base =
                 start_point.map_or(Decimal::ZERO, Self::account_unrealized_base);
-            let local_unrealized_change =
-                Self::account_unrealized_local(end_point) - start_unrealized_local;
+            // Opening book carried in by positions entering tracking inside the
+            // window (a provider link) is a migration event, not return.
+            // Holdings snapshots only: transaction-mode cost basis comes from
+            // real trades, so a first buy is never a provider opening book.
+            let (bootstrap_local, bootstrap_base) = match start_index {
+                Some(start_index) if exclude_position_bootstrap && start_index < end_index => {
+                    history[start_index..=end_index]
+                        .windows(2)
+                        .filter(|w| Self::is_position_tracking_bootstrap(&w[0], &w[1]))
+                        .fold((Decimal::ZERO, Decimal::ZERO), |(local, base), w| {
+                            (
+                                local + Self::account_unrealized_local(&w[1])
+                                    - Self::account_unrealized_local(&w[0]),
+                                base + Self::account_unrealized_base(&w[1])
+                                    - Self::account_unrealized_base(&w[0]),
+                            )
+                        })
+                }
+                _ => (Decimal::ZERO, Decimal::ZERO),
+            };
+            let local_unrealized_change = Self::account_unrealized_local(end_point)
+                - start_unrealized_local
+                - bootstrap_local;
             let base_unrealized_change =
-                Self::account_unrealized_base(end_point) - start_unrealized_base;
+                Self::account_unrealized_base(end_point) - start_unrealized_base - bootstrap_base;
             let local_change_at_end_fx = local_unrealized_change * end_fx_rate;
 
             unrealized_pnl_change += local_change_at_end_fx;
@@ -3645,7 +3704,10 @@ impl PerformanceService {
                 // gain change is the native flow-neutral measure: principal
                 // entering or leaving cash/positions changes value and basis
                 // together, while yield changes gain.
-                let day_gain = if Self::return_total_value(curr, flow_basis).is_zero()
+                let day_gain = if Self::is_position_tracking_bootstrap(prev, curr) {
+                    // Positions entering tracking carry an opening book, not return.
+                    Decimal::ZERO
+                } else if Self::return_total_value(curr, flow_basis).is_zero()
                     && flow.source.is_explicit_gross()
                     && flow.outflow > Decimal::ZERO
                     && prev_gain > Decimal::ZERO
@@ -3722,8 +3784,7 @@ impl PerformanceService {
                 Some((None, None))
             } else {
                 Some(Self::compute_holdings_value_return(
-                    start_point,
-                    end_point,
+                    full_history,
                     &daily_flows,
                     start_date_opt.is_none() && !crypto_only,
                     flow_basis,
@@ -4053,8 +4114,7 @@ impl PerformanceService {
                 (None, None)
             } else {
                 Self::compute_holdings_value_return(
-                    start_point,
-                    end_point,
+                    component.history,
                     &daily_flows,
                     is_all_time,
                     flow_basis,
@@ -10221,6 +10281,7 @@ mod tests {
             date("2026-05-01"),
             date("2026-05-02"),
             AttributionBaseline::PeriodStart,
+            false,
         );
 
         assert!(attribution.complete);
@@ -10267,6 +10328,7 @@ mod tests {
             date("2026-05-01"),
             date("2026-05-02"),
             AttributionBaseline::PeriodStart,
+            false,
         );
 
         assert!(attribution.complete);
@@ -10286,12 +10348,14 @@ mod tests {
             date("2026-01-10"),
             date("2026-01-12"),
             AttributionBaseline::Inception,
+            false,
         );
         let bounded = PerformanceService::scoped_unrealized_attribution_components(
             &[history],
             date("2026-01-10"),
             date("2026-01-12"),
             AttributionBaseline::PeriodStart,
+            false,
         );
 
         assert!(all_time.complete);
@@ -11066,11 +11130,13 @@ mod tests {
             false,
         )
         .expect("holdings period should compute");
-        // This is the bug as it shipped: a ~9,837 fabricated gain in 3 days on an
-        // account that only actually earned a few hundred reais of real interest.
+        // This was the bug as it shipped: a ~9,837 fabricated gain in 3 days. The
+        // unbridged shape is still what production stores for links written before
+        // the bridge existed, so the period formula itself must neutralize it:
+        // positions entering tracking carry an opening book, not return.
         assert_eq!(
             attribution_pnl(&unbridged_result).round_dp(2),
-            dec!(9836.96)
+            Decimal::ZERO
         );
 
         // Bridged (post-fix) shape: cost_basis is set so book_basis (cost_basis +
@@ -11090,8 +11156,9 @@ mod tests {
             false,
         )
         .expect("holdings period should compute");
-        // Only the real 3-day value change remains - small, plausible, not fabricated.
-        assert_eq!(attribution_pnl(&bridged_result).round_dp(2), dec!(302.19));
+        // The link day itself is a migration event: its 302.19 value move cannot be
+        // separated from reconciliation drift, so it is not reported as return.
+        assert_eq!(attribution_pnl(&bridged_result).round_dp(2), Decimal::ZERO);
     }
 
     /// BV, Mercado Pago and Mercado Pago 2 golden proofs through the same real
@@ -11144,8 +11211,8 @@ mod tests {
         // fix's new fallback branch - cash never exceeds prior book_basis here).
         assert_eq!(
             migration_gain(dec!(71446.00), dec!(71446.00), dec!(70000.00)),
-            dec!(1446.00),
-            "BV pre-fix (raw, unbridged cost_basis): the 1,446.00 book_basis gap reads as gain"
+            Decimal::ZERO,
+            "BV raw, unbridged cost_basis: the 1,446.00 book_basis gap is migration, not gain"
         );
         assert_eq!(
             migration_gain(dec!(71446.00), dec!(71446.00), dec!(71446.00)),
@@ -11160,8 +11227,8 @@ mod tests {
         // than the original, un-bridged defect.
         assert_eq!(
             migration_gain(dec!(6120.00), dec!(4457.07), Decimal::ZERO),
-            dec!(4457.07),
-            "Mercado Pago floor-at-zero bug: the whole position value reads as gain"
+            Decimal::ZERO,
+            "Mercado Pago zero cost_basis: position value entering tracking is not gain"
         );
         assert_eq!(
             migration_gain(dec!(6120.00), dec!(4457.07), dec!(4457.07)),
@@ -11174,8 +11241,8 @@ mod tests {
         // 4,329.98.
         assert_eq!(
             migration_gain(dec!(4693.11417426), dec!(4693.11417426), dec!(4329.98)),
-            dec!(363.13),
-            "Mercado Pago 2 pre-fix (raw, unbridged cost_basis): the book_basis gap reads as gain"
+            Decimal::ZERO,
+            "Mercado Pago 2 raw, unbridged cost_basis: the book_basis gap is migration, not gain"
         );
         assert_eq!(
             migration_gain(
@@ -12907,5 +12974,400 @@ mod tests {
         assert!(result.risk.volatility.is_some());
         assert!(result.data_quality.warnings.is_empty());
         assert_eq!(result.data_quality.status, DataQualityStatus::Ok);
+    }
+
+    // ---------------------------------------------------------------------
+    // Period-performance coherence (1M vs 6M) — regression suite.
+    //
+    // Reproduces the production dashboard defect: for a manual cash account
+    // later linked to Pluggy, the first snapshot that carries positions
+    // arrives with a provider cost basis that differs from the account's own
+    // book. `investment_market_value - cost_basis` then jumps on the link day,
+    // and every period whose start predates the link (1M, 6M, ...) reported
+    // that jump as investment gain, while the headline percent was the
+    // position-only chained return (the jump / prior value) and ignored the
+    // booked interest entirely - hence "gain changes between 1M and 6M but
+    // percent stays exactly the same" (BTG 6.99%, BV 2.24%, MP 9.01%, MP2
+    // 11.02%).
+    //
+    // Invariants encoded here (water-tank semantics):
+    //   * deposits / withdrawals / reconciliations are not return;
+    //   * the migration/link event is not return;
+    //   * booked yield (INTEREST) inside the period is return;
+    //   * post-link position appreciation inside the period is return;
+    //   * percent numerator == displayed amount, denominator == average
+    //     capital over the same selected period.
+    // ---------------------------------------------------------------------
+
+    struct PeriodDay {
+        cash: Decimal,
+        invested: Decimal,
+        cost: Decimal,
+        net_contribution: Decimal,
+        inflow: Decimal,
+        outflow: Decimal,
+    }
+
+    fn period_daily_history(
+        account_id: &str,
+        from: &str,
+        to: &str,
+        day: impl Fn(NaiveDate) -> PeriodDay,
+    ) -> Vec<DailyAccountValuation> {
+        let mut out = Vec::new();
+        let mut d = date(from);
+        let end = date(to);
+        while d <= end {
+            let p = day(d);
+            let mut v = account_valuation(
+                account_id,
+                &d.format("%Y-%m-%d").to_string(),
+                p.cash + p.invested,
+                p.net_contribution,
+                p.invested,
+                p.cost,
+            );
+            v.external_inflow_base = p.inflow;
+            v.external_outflow_base = p.outflow;
+            v.external_flow_source = if p.inflow.is_zero() && p.outflow.is_zero() {
+                ValuationExternalFlowSource::NoFlow
+            } else {
+                ValuationExternalFlowSource::NetContributionFallback
+            };
+            out.push(v);
+            d = d.succ_opt().unwrap();
+        }
+        out
+    }
+
+    fn cad_income(id: &str, account_id: &str, day: &str, amount: Decimal) -> Activity {
+        let mut a = income_activity_on(id, account_id, day, ActivityType::Interest, amount);
+        a.currency = "CAD".to_string();
+        a
+    }
+
+    /// BTG-shaped history: manual cash account with booked monthly interest,
+    /// a deposit and a withdrawal inside 6M, then a Pluggy link on 09-21 whose
+    /// provider cost basis (103,000) is 9,800 below the account's own book.
+    fn btg_shaped_history() -> Vec<DailyAccountValuation> {
+        period_daily_history("btg", "2026-03-01", "2026-09-22", |d| {
+            let zero = Decimal::ZERO;
+            let mut cash = dec!(100000);
+            let mut inflow = zero;
+            let mut outflow = zero;
+            if d >= date("2026-04-15") {
+                cash += dec!(20000); // external deposit: not return
+            }
+            if d == date("2026-04-15") {
+                inflow = dec!(20000);
+            }
+            if d >= date("2026-05-31") {
+                cash += dec!(1000); // booked INTEREST
+            }
+            if d >= date("2026-06-30") {
+                cash -= dec!(10000); // external withdrawal: not a loss
+            }
+            if d == date("2026-06-30") {
+                outflow = dec!(10000);
+            }
+            if d >= date("2026-08-31") {
+                cash += dec!(1500); // booked INTEREST
+            }
+            let net = dec!(110000);
+            if d == date("2026-09-21") {
+                // Pluggy link: cash becomes a position. 300 of the move is
+                // unbookable drift absorbed by the migration; provider cost
+                // basis is 103,000 (a 9,800 book gap, not a gain).
+                return PeriodDay {
+                    cash: zero,
+                    invested: dec!(112800),
+                    cost: dec!(103000),
+                    net_contribution: net,
+                    inflow: zero,
+                    outflow: zero,
+                };
+            }
+            if d == date("2026-09-22") {
+                // Real post-link appreciation: +50.
+                return PeriodDay {
+                    cash: zero,
+                    invested: dec!(112850),
+                    cost: dec!(103000),
+                    net_contribution: net,
+                    inflow: zero,
+                    outflow: zero,
+                };
+            }
+            PeriodDay {
+                cash,
+                invested: zero,
+                cost: zero,
+                net_contribution: net,
+                inflow,
+                outflow,
+            }
+        })
+    }
+
+    fn btg_shaped_activities() -> Vec<Activity> {
+        vec![
+            cad_income("btg-int-may", "btg", "2026-05-31", dec!(1000)),
+            cad_income("btg-int-aug", "btg", "2026-08-31", dec!(1500)),
+        ]
+    }
+
+    async fn dashboard_holdings_period(
+        history: Vec<DailyAccountValuation>,
+        activities: Vec<Activity>,
+        account_id: &str,
+        start: &str,
+        end: &str,
+    ) -> PerformanceResult {
+        let valuation_service = Arc::new(TestValuationService::new(history));
+        let service = PerformanceService::new(valuation_service, Arc::new(TestQuoteService))
+            .with_activity_repository(
+                Arc::new(TestActivityRepository::new(activities)),
+                Arc::new(TestFxService),
+            );
+        let account_ids = vec![account_id.to_string()];
+        let mut modes = HashMap::new();
+        modes.insert(account_id.to_string(), TrackingMode::Holdings);
+        let mut account_types = HashMap::new();
+        account_types.insert(account_id.to_string(), "CASH".to_string());
+        service
+            .calculate_performance_summary_for_accounts(
+                account_id,
+                &account_ids,
+                "CAD",
+                &modes,
+                &account_types,
+                Some(date(start)),
+                Some(date(end)),
+                PerformanceSummaryProfile::Dashboard,
+            )
+            .await
+            .expect("dashboard holdings period should compute")
+    }
+
+    fn average_total_value(history: &[DailyAccountValuation], start: &str, end: &str) -> Decimal {
+        let window: Vec<_> = history
+            .iter()
+            .filter(|p| p.valuation_date >= date(start) && p.valuation_date <= date(end))
+            .collect();
+        window.iter().map(|p| p.total_value_base).sum::<Decimal>() / Decimal::from(window.len())
+    }
+
+    fn assert_percent_matches_amount_over_average_capital(
+        result: &PerformanceResult,
+        history: &[DailyAccountValuation],
+        start: &str,
+        end: &str,
+    ) {
+        let amount = result.summary.amount.expect("amount should be available");
+        let percent = result.summary.percent.expect("percent should be available");
+        let average = average_total_value(history, start, end);
+        assert_eq!(
+            percent.round_dp(6),
+            (amount / average).round_dp(6),
+            "percent must be the displayed amount over the same period's average capital"
+        );
+    }
+
+    #[tokio::test]
+    async fn period_gain_excludes_pluggy_link_book_gap_for_1m_and_6m() {
+        let history = btg_shaped_history();
+
+        let one_month = dashboard_holdings_period(
+            history.clone(),
+            btg_shaped_activities(),
+            "btg",
+            "2026-08-22",
+            "2026-09-22",
+        )
+        .await;
+        let six_months = dashboard_holdings_period(
+            history.clone(),
+            btg_shaped_activities(),
+            "btg",
+            "2026-03-22",
+            "2026-09-22",
+        )
+        .await;
+
+        // 1M: August interest (1,500) + real post-link appreciation (50).
+        // The 9,800 book gap and the 300 link-day drift are migration, not return.
+        assert_eq!(one_month.summary.amount, Some(dec!(1550)));
+        // 6M: May + August interest + post-link appreciation. The 20,000
+        // deposit and the 10,000 withdrawal contribute nothing.
+        assert_eq!(six_months.summary.amount, Some(dec!(2550)));
+
+        assert_percent_matches_amount_over_average_capital(
+            &one_month,
+            &history,
+            "2026-08-22",
+            "2026-09-22",
+        );
+        assert_percent_matches_amount_over_average_capital(
+            &six_months,
+            &history,
+            "2026-03-22",
+            "2026-09-22",
+        );
+        assert_ne!(
+            one_month.summary.percent, six_months.summary.percent,
+            "different periods with different gains cannot share one percent"
+        );
+    }
+
+    #[tokio::test]
+    async fn period_after_link_measures_only_post_link_appreciation() {
+        // A period that starts after the link sees no migration at all: only
+        // real position appreciation counts, and the chained position return
+        // (which equals the chart) remains the percent.
+        let history = btg_shaped_history();
+        let result = dashboard_holdings_period(
+            history,
+            btg_shaped_activities(),
+            "btg",
+            "2026-09-21",
+            "2026-09-22",
+        )
+        .await;
+        assert_eq!(result.summary.amount, Some(dec!(50)));
+        assert_eq!(
+            result.summary.percent.unwrap().round_dp(8),
+            (dec!(50) / dec!(112800)).round_dp(8)
+        );
+    }
+
+    #[test]
+    fn holdings_chain_and_amount_ignore_position_bootstrap_jump() {
+        // Pure formula check through compute_account_performance: the day on
+        // which positions first enter tracking (prior day had none) carries
+        // the provider's opening unrealized figure, which is not return.
+        let history = vec![
+            valuation(
+                "2026-09-19",
+                dec!(112500),
+                dec!(110000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-09-20",
+                dec!(112500),
+                dec!(110000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "2026-09-21",
+                dec!(112800),
+                dec!(110000),
+                dec!(112800),
+                dec!(103000),
+            ),
+            valuation(
+                "2026-09-22",
+                dec!(112850),
+                dec!(110000),
+                dec!(112850),
+                dec!(103000),
+            ),
+        ];
+        let result = PerformanceService::compute_account_performance(
+            &history,
+            Some(TrackingMode::Holdings),
+            Some(date("2026-09-19")),
+            true,
+        )
+        .expect("holdings period should compute");
+        assert_eq!(attribution_pnl(&result).round_dp(2), dec!(50.00));
+        assert_eq!(
+            result.returns.value_return.unwrap().round_dp(8),
+            (dec!(50) / dec!(112800)).round_dp(8)
+        );
+        assert_eq!(
+            result.series.last().unwrap().value.round_dp(8),
+            (dec!(50) / dec!(112800)).round_dp(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_income_account_period_semantics_are_flow_neutral() {
+        // Long-lived manual fixed-income account (BV Mãe shape): deposit and a
+        // reconciliation jump inside the window, monthly booked interest.
+        let history = period_daily_history("bvmae", "2026-02-01", "2026-09-22", |d| {
+            let zero = Decimal::ZERO;
+            let mut cash = dec!(50000);
+            let mut inflow = zero;
+            let mut outflow = zero;
+            if d >= date("2026-03-15") {
+                cash += dec!(50000);
+            }
+            if d == date("2026-03-15") {
+                inflow = dec!(50000);
+            }
+            if d >= date("2026-04-30") {
+                cash += dec!(1200);
+            }
+            if d >= date("2026-07-10") {
+                // Reconciliation to the bank's statement: no activity, not return.
+                cash += dec!(800);
+            }
+            if d >= date("2026-08-31") {
+                cash += dec!(1400);
+            }
+            if d >= date("2026-09-10") {
+                cash -= dec!(5000);
+            }
+            if d == date("2026-09-10") {
+                outflow = dec!(5000);
+            }
+            PeriodDay {
+                cash,
+                invested: zero,
+                cost: zero,
+                net_contribution: dec!(95000),
+                inflow,
+                outflow,
+            }
+        });
+        let activities = vec![
+            cad_income("bv-apr", "bvmae", "2026-04-30", dec!(1200)),
+            cad_income("bv-aug", "bvmae", "2026-08-31", dec!(1400)),
+        ];
+
+        let one_month = dashboard_holdings_period(
+            history.clone(),
+            activities.clone(),
+            "bvmae",
+            "2026-08-22",
+            "2026-09-22",
+        )
+        .await;
+        let six_months = dashboard_holdings_period(
+            history.clone(),
+            activities,
+            "bvmae",
+            "2026-03-01",
+            "2026-09-22",
+        )
+        .await;
+
+        assert_eq!(one_month.summary.amount, Some(dec!(1400)));
+        assert_eq!(six_months.summary.amount, Some(dec!(2600)));
+        assert_percent_matches_amount_over_average_capital(
+            &one_month,
+            &history,
+            "2026-08-22",
+            "2026-09-22",
+        );
+        assert_percent_matches_amount_over_average_capital(
+            &six_months,
+            &history,
+            "2026-03-01",
+            "2026-09-22",
+        );
     }
 }
