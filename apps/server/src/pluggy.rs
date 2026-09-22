@@ -498,6 +498,27 @@ pub fn item_unavailable(connector: Option<&str>, updated_at: Option<&str>) -> bo
     connector.is_none() && updated_at.is_none()
 }
 
+const INVESTMENTS_INCOMPLETE: &str =
+    "Pluggy investments unavailable this run; snapshot not written to avoid dropping positions";
+
+/// Whether a linked item's investment snapshot must be skipped this run, and why. An
+/// item whose `/investments` call failed is reachable but incomplete: `st.investments`
+/// will simply be missing its positions, so writing a snapshot anyway would report a
+/// spurious drop in value today and a spurious recovery once the read next succeeds.
+pub fn item_snapshot_block_reason(
+    item_id: &str,
+    unavailable: &HashSet<String>,
+    investments_failed: &HashSet<String>,
+) -> Option<&'static str> {
+    if unavailable.contains(item_id) {
+        Some(ITEM_UNAVAILABLE)
+    } else if investments_failed.contains(item_id) {
+        Some(INVESTMENTS_INCOMPLETE)
+    } else {
+        None
+    }
+}
+
 /// MeuPluggy proxies every bank through one connector, so the connector name says
 /// nothing about the institution; label the item after its first account instead.
 pub fn derive_institution(connector: Option<&str>, accounts: &[PluggyAccount]) -> Option<String> {
@@ -1170,6 +1191,10 @@ async fn sync_inner(
     // Items Pluggy could not read this run (expired, revoked, transient error): never write
     // anything for them, since their stored balances would be stale.
     let mut unavailable: HashSet<String> = HashSet::new();
+    // Items whose investments failed to load this run even though the item itself is
+    // reachable: `st.investments` will be missing this item's positions below, so its
+    // snapshot must be skipped rather than written without them (see step 3).
+    let mut investments_failed: HashSet<String> = HashSet::new();
     for item_id in &cfg.item_ids {
         let (connector, item_updated_at) = client.item_meta(item_id).await;
         if item_unavailable(connector.as_deref(), item_updated_at.as_deref()) {
@@ -1305,6 +1330,7 @@ async fn sync_inner(
             })),
             Err(e) => {
                 warn!("Pluggy investments unavailable for an item: {e}");
+                investments_failed.insert(item_id.clone());
                 if let Some(l) = st.items.get_mut(item_id) {
                     l.last_error = Some(format!("investments fetch failed: {e}"));
                 }
@@ -1543,8 +1569,10 @@ async fn sync_inner(
         .values_mut()
         .filter(|l| l.status == LinkStatus::Linked)
     {
-        if unavailable.contains(&link.item_id) {
-            link.last_error = Some(ITEM_UNAVAILABLE.into());
+        if let Some(reason) =
+            item_snapshot_block_reason(&link.item_id, &unavailable, &investments_failed)
+        {
+            link.last_error = Some(reason.into());
             continue;
         }
         let Some(wf_id) = link.linked_account_id.clone() else {
@@ -2483,5 +2511,39 @@ mod tests {
             Some("2026-09-21T22:06:42.745Z")
         ));
         assert!(!item_unavailable(Some("MeuPluggy"), None));
+    }
+
+    #[test]
+    fn an_item_with_no_readable_investments_never_gets_a_partial_snapshot() {
+        // A failed /investments call must never fall through to writing a snapshot
+        // built from `st.investments` missing that item's positions: that would report
+        // a spurious drop in value today, and a spurious recovery once the read
+        // succeeds again (a manufactured swing with no real flow behind it).
+        let unavailable: HashSet<String> = HashSet::new();
+        let mut investments_failed: HashSet<String> = HashSet::new();
+        investments_failed.insert("item-1".into());
+
+        assert_eq!(
+            item_snapshot_block_reason("item-1", &unavailable, &investments_failed),
+            Some(INVESTMENTS_INCOMPLETE)
+        );
+        // An unrelated item with readable investments is unaffected.
+        assert_eq!(
+            item_snapshot_block_reason("item-2", &unavailable, &investments_failed),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fully_unavailable_item_takes_priority_over_an_investments_only_failure() {
+        let mut unavailable: HashSet<String> = HashSet::new();
+        unavailable.insert("item-1".into());
+        let mut investments_failed: HashSet<String> = HashSet::new();
+        investments_failed.insert("item-1".into());
+
+        assert_eq!(
+            item_snapshot_block_reason("item-1", &unavailable, &investments_failed),
+            Some(ITEM_UNAVAILABLE)
+        );
     }
 }
