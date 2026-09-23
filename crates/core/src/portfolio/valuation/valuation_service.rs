@@ -1,6 +1,6 @@
 use crate::activities::{
     Activity, ActivityRepositoryTrait, TransferPairResolution, ACTIVITY_TYPE_TRANSFER_IN,
-    ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL,
+    ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL, INCOME_ACTIVITY_TYPES,
 };
 use crate::errors::{CalculatorError, Error as CoreError, Result as CoreResult, ValidationError};
 use crate::fx::currency::normalize_currency_code;
@@ -747,15 +747,24 @@ impl ValuationService {
         let mut values: Vec<_> = by_date.into_values().collect();
         let authoritative_flow_dates = external_flows_by_date
             .map(|flows_by_date| flows_by_date.keys().copied().collect::<HashSet<_>>());
+        // Aggregation combines per-account histories that were already
+        // stamped (with income rescued from NetContributionFallback) when
+        // each account's own valuations were computed; this fallback only
+        // covers scope-level reclassification, so it has no direct activity
+        // ledger to consult here and passes an empty income map.
+        let no_income = BTreeMap::new();
         match external_flows_by_date {
             Some(flows_by_date) => {
                 Self::set_external_flows_from_activity_map_or_net_contribution_base(
                     &mut values,
                     flows_by_date,
+                    &no_income,
                     true,
                 );
             }
-            None => Self::set_external_flows_from_net_contribution_base(&mut values, true),
+            None => {
+                Self::set_external_flows_from_net_contribution_base(&mut values, &no_income, true)
+            }
         }
         if let Some(adjustments_by_date) = internal_transfer_flow_adjustments_by_date {
             Self::apply_internal_transfer_flow_adjustments(
@@ -911,6 +920,7 @@ impl ValuationService {
         valuations: &mut [DailyAccountValuation],
         account: &PreparedValuationAccount,
         facts: &SharedValuationFacts,
+        income_by_date: &BTreeMap<NaiveDate, Decimal>,
     ) {
         if valuations.len() < 2 {
             return;
@@ -920,19 +930,29 @@ impl ValuationService {
             facts.acquisition_fx_rates_by_date(&account.acquisition_fx_requests);
         let mut quote_assets: Vec<_> = account.required_asset_ids.iter().cloned().collect();
         quote_assets.sort();
+        // A holdings keyframe only changes on the day a new snapshot lands,
+        // so a quiet row-to-row pair below (same keyframe on both sides) has
+        // nothing to price a flow against yet. Carry any INTEREST/DIVIDEND
+        // posted during those quiet rows forward and resolve it against the
+        // first later transition this function actually prices.
+        let mut pending_income = Decimal::ZERO;
         for index in 1..valuations.len() {
             let prev_date = valuations[index - 1].valuation_date;
             let curr_date = valuations[index].valuation_date;
+            let gap_income = Self::income_in_gap(income_by_date, prev_date, curr_date);
             let Some(prev_keyframe) = account.timeline.snapshot_at(prev_date) else {
+                pending_income += gap_income;
                 continue;
             };
             let Some(curr_keyframe) = account.timeline.snapshot_at(curr_date) else {
+                pending_income += gap_income;
                 continue;
             };
             if prev_keyframe.snapshot_date == curr_keyframe.snapshot_date
                 || prev_keyframe.source == SnapshotSource::Calculated
                 || curr_keyframe.source == SnapshotSource::Calculated
             {
+                pending_income += gap_income;
                 continue;
             }
             let quotes_today: HashMap<_, _> = quote_assets
@@ -988,22 +1008,34 @@ impl ValuationService {
                     valuations[index].external_outflow_base = Decimal::ZERO;
                     valuations[index].external_flow_source =
                         ExternalFlowSource::UnpricedHoldingsTransition;
+                    pending_income += gap_income;
                     continue;
                 }
             };
             let flow_base = valuations[index].total_value_base - prev_at_curr.total_value_base;
-            if flow_base.is_zero() {
+            // Same rescue as the net-contribution fallback: known INTEREST/
+            // DIVIDEND posted since the last row this function actually
+            // priced is return, not a quote-derived flow, even though this
+            // inference has no way to tell a cash-only account's accrued
+            // yield apart from a real deposit/withdrawal by pricing alone.
+            // Net it out first; only classify what income can't explain.
+            let known_income = pending_income + gap_income;
+            let residual = flow_base - known_income;
+            if residual.is_zero() {
+                pending_income = Decimal::ZERO;
                 continue;
             }
-            let (inflow, outflow) = Self::split_external_flow(flow_base);
+            let (inflow, outflow) = Self::split_external_flow(residual);
             valuations[index].external_inflow_base = inflow;
             valuations[index].external_outflow_base = outflow;
             valuations[index].external_flow_source = ExternalFlowSource::QuoteDerivedMarketValue;
+            pending_income = Decimal::ZERO;
         }
     }
 
     fn set_external_flows_from_net_contribution_base(
         values: &mut [DailyAccountValuation],
+        income_by_date: &BTreeMap<NaiveDate, Decimal>,
         preserve_unavailable: bool,
     ) {
         if values.is_empty() {
@@ -1015,7 +1047,20 @@ impl ValuationService {
         values[0].external_outflow_base = rust_decimal::Decimal::ZERO;
         values[0].external_flow_source = ExternalFlowSource::NetContributionFallback;
 
+        // Holdings-mode `net_contribution_base` is flat between real
+        // snapshot/keyframe writes and only jumps on the day a new one
+        // lands, so INTEREST/DIVIDEND posted on a quiet day in between has
+        // no delta to be netted against yet. Carry it forward and resolve it
+        // against the first later day whose delta is actually nonzero,
+        // rather than misreading a quiet day's own zero delta as a phantom
+        // outflow of that day's income.
+        let mut pending_income = Decimal::ZERO;
         for index in 1..values.len() {
+            let gap_income = Self::income_in_gap(
+                income_by_date,
+                values[index - 1].valuation_date,
+                values[index].valuation_date,
+            );
             // The plain Unknown marker (an unpriceable holdings transition
             // summed into an aggregate row) is sticky: it must keep gating
             // returns, never be relabeled into a trustworthy source.
@@ -1025,6 +1070,7 @@ impl ValuationService {
                 && values[index].external_flow_source
                     == ExternalFlowSource::UnpricedHoldingsTransition
             {
+                pending_income += gap_income;
                 continue;
             }
             let delta =
@@ -1033,19 +1079,41 @@ impl ValuationService {
                 if values[index].external_flow_source == ExternalFlowSource::NoFlow {
                     values[index].external_flow_source = ExternalFlowSource::StoredGross;
                 }
+                pending_income += gap_income;
                 continue;
             }
 
-            let (inflow, outflow) = Self::split_external_flow(delta);
+            if delta.is_zero() {
+                // Nothing moved yet on this row - defer any income posted
+                // today to whichever later row actually shows the jump.
+                pending_income += gap_income;
+                values[index].external_inflow_base = Decimal::ZERO;
+                values[index].external_outflow_base = Decimal::ZERO;
+                values[index].external_flow_source = ExternalFlowSource::NetContributionFallback;
+                continue;
+            }
+
+            // Known INTEREST/DIVIDEND posted anywhere since the last row
+            // this function actually resolved is return, never flow - net
+            // it out of the raw delta before the remainder is classified as
+            // an external flow. Only the still-unexplained residual (real
+            // capital movement, or a reconciliation this map cannot account
+            // for) becomes flow.
+            let known_income = pending_income + gap_income;
+            let residual = delta - known_income;
+
+            let (inflow, outflow) = Self::split_external_flow(residual);
             values[index].external_inflow_base = inflow;
             values[index].external_outflow_base = outflow;
             values[index].external_flow_source = ExternalFlowSource::NetContributionFallback;
+            pending_income = Decimal::ZERO;
         }
     }
 
     fn set_external_flows_from_activity_map_or_net_contribution_base(
         values: &mut [DailyAccountValuation],
         flows_by_date: &HashMap<NaiveDate, DailyFlowAmounts>,
+        income_by_date: &BTreeMap<NaiveDate, Decimal>,
         preserve_unavailable: bool,
     ) {
         if values.is_empty() {
@@ -1057,7 +1125,18 @@ impl ValuationService {
         values[0].external_outflow_base = Decimal::ZERO;
         values[0].external_flow_source = ExternalFlowSource::NoFlow;
 
+        // Same reasoning as the net-contribution-only variant: a holdings
+        // keyframe's delta only shows up on the day the next snapshot lands,
+        // so INTEREST/DIVIDEND posted on a quiet day in between must be
+        // carried forward and resolved against the first later day with an
+        // actual nonzero delta (or an explicit same-day activity).
+        let mut pending_income = Decimal::ZERO;
         for index in 1..values.len() {
+            let gap_income = Self::income_in_gap(
+                income_by_date,
+                values[index - 1].valuation_date,
+                values[index].valuation_date,
+            );
             let delta =
                 values[index].net_contribution_base - values[index - 1].net_contribution_base;
             // The activity map is authoritative: scope-aware flow inputs
@@ -1067,6 +1146,7 @@ impl ValuationService {
                 values[index].external_inflow_base = flow.inflow;
                 values[index].external_outflow_base = flow.outflow;
                 values[index].external_flow_source = flow.source;
+                pending_income += gap_income;
                 continue;
             }
             // The plain Unknown marker is sticky against the fallback paths
@@ -1080,6 +1160,7 @@ impl ValuationService {
                 && values[index].external_flow_source
                     == ExternalFlowSource::UnpricedHoldingsTransition
             {
+                pending_income += gap_income;
                 continue;
             }
 
@@ -1087,20 +1168,43 @@ impl ValuationService {
                 if values[index].external_flow_source == ExternalFlowSource::NoFlow {
                     values[index].external_flow_source = ExternalFlowSource::StoredGross;
                 }
+                pending_income += gap_income;
                 continue;
             }
 
             if delta.is_zero() {
+                // Nothing moved yet on this row - defer any income posted
+                // today to whichever later row actually shows the jump.
+                pending_income += gap_income;
                 values[index].external_inflow_base = Decimal::ZERO;
                 values[index].external_outflow_base = Decimal::ZERO;
                 values[index].external_flow_source = ExternalFlowSource::NoFlow;
                 continue;
             }
 
-            let (inflow, outflow) = Self::split_external_flow(delta);
+            // No same-day activity explains this keyframe's delta. Before
+            // dumping the whole thing into NetContributionFallback, net out
+            // any INTEREST/DIVIDEND posted anywhere since the last row this
+            // function actually resolved - those activities never get an
+            // entry in `flows_by_date` (they are not flows), so without this
+            // they were silently absorbed as phantom capital movement. Only
+            // the still-unexplained residual becomes flow.
+            let known_income = pending_income + gap_income;
+            let residual = delta - known_income;
+
+            if residual.is_zero() {
+                values[index].external_inflow_base = Decimal::ZERO;
+                values[index].external_outflow_base = Decimal::ZERO;
+                values[index].external_flow_source = ExternalFlowSource::NoFlow;
+                pending_income = Decimal::ZERO;
+                continue;
+            }
+
+            let (inflow, outflow) = Self::split_external_flow(residual);
             values[index].external_inflow_base = inflow;
             values[index].external_outflow_base = outflow;
             values[index].external_flow_source = ExternalFlowSource::NetContributionFallback;
+            pending_income = Decimal::ZERO;
         }
     }
 
@@ -1951,6 +2055,86 @@ impl ValuationService {
         Ok(flows_by_date)
     }
 
+    /// Sums INTEREST/DIVIDEND activity amounts per date, in base currency.
+    ///
+    /// Explicit income is never a capital flow (`classify_flow_for_scope` maps
+    /// it to `FlowType::Internal`), so it never gets an entry in
+    /// `flows_by_date` at all. Keyframe-boundary flow inference
+    /// (`set_external_flows_from_activity_map_or_net_contribution_base`,
+    /// `apply_inferred_holdings_external_flows`) needs this separately so it
+    /// can net known income out of an inferred delta before classifying the
+    /// rest as external flow - otherwise income accrued between two
+    /// Pluggy/manual snapshots is silently swallowed as a phantom
+    /// contribution or withdrawal.
+    fn income_by_date_from_scoped_inputs(
+        &self,
+        inputs: &ScopedFlowInputs,
+        base_currency: &str,
+        start_date_opt: Option<NaiveDate>,
+        end_date_opt: Option<NaiveDate>,
+    ) -> CoreResult<BTreeMap<NaiveDate, Decimal>> {
+        let mut income_by_date: BTreeMap<NaiveDate, Decimal> = BTreeMap::new();
+        let base_currency = normalize_currency_code(base_currency);
+        for activity in inputs
+            .merged_activities
+            .iter()
+            .filter(|activity| inputs.scope_account_ids.contains(&activity.account_id))
+        {
+            if !activity.is_posted() {
+                continue;
+            }
+            let effective_type = activity.effective_type();
+            if !INCOME_ACTIVITY_TYPES.contains(&effective_type) {
+                continue;
+            }
+            let activity_date =
+                time_utils::activity_date_in_tz(activity.activity_date, inputs.timezone);
+            if !Self::activity_date_in_range(activity_date, start_date_opt, end_date_opt) {
+                continue;
+            }
+            let Some(amount) = activity.amount else {
+                continue;
+            };
+            let amount = amount.abs();
+            if amount.is_zero() {
+                continue;
+            }
+            let activity_currency = normalize_currency_code(&activity.currency);
+            let amount_base = if activity_currency == base_currency {
+                amount
+            } else {
+                self.fx_service.convert_currency_for_date(
+                    amount,
+                    activity_currency,
+                    base_currency,
+                    activity_date,
+                )?
+            };
+            *income_by_date.entry(activity_date).or_insert(Decimal::ZERO) += amount_base;
+        }
+        Ok(income_by_date)
+    }
+
+    /// Known income (INTEREST/DIVIDEND) recorded in `(from, to]`, summed in
+    /// base currency. Used to net income out of an inferred keyframe-
+    /// transition delta before classifying the residual as external flow.
+    fn income_in_gap(
+        income_by_date: &BTreeMap<NaiveDate, Decimal>,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Decimal {
+        if to <= from {
+            return Decimal::ZERO;
+        }
+        income_by_date
+            .range((
+                std::ops::Bound::Excluded(from),
+                std::ops::Bound::Included(to),
+            ))
+            .map(|(_, amount)| *amount)
+            .sum()
+    }
+
     fn internal_transfer_adjustments_from_scoped_inputs(
         &self,
         inputs: &ScopedFlowInputs,
@@ -2037,15 +2221,21 @@ impl ValuationService {
         }))
     }
 
+    #[allow(clippy::type_complexity)]
     fn account_external_flows_by_date(
         &self,
         account_ids: &[String],
         base_currency: &str,
         start_date_opt: Option<NaiveDate>,
         end_date_opt: Option<NaiveDate>,
-    ) -> CoreResult<Option<HashMap<NaiveDate, DailyFlowAmounts>>> {
+    ) -> CoreResult<
+        Option<(
+            HashMap<NaiveDate, DailyFlowAmounts>,
+            BTreeMap<NaiveDate, Decimal>,
+        )>,
+    > {
         if account_ids.is_empty() {
-            return Ok(Some(HashMap::new()));
+            return Ok(Some((HashMap::new(), BTreeMap::new())));
         }
         let Some(inputs) = self.prepare_scoped_flow_inputs(
             account_ids,
@@ -2056,8 +2246,19 @@ impl ValuationService {
         else {
             return Ok(None);
         };
-        self.external_flows_from_scoped_inputs(&inputs, base_currency, start_date_opt, end_date_opt)
-            .map(Some)
+        let flows_by_date = self.external_flows_from_scoped_inputs(
+            &inputs,
+            base_currency,
+            start_date_opt,
+            end_date_opt,
+        )?;
+        let income_by_date = self.income_by_date_from_scoped_inputs(
+            &inputs,
+            base_currency,
+            start_date_opt,
+            end_date_opt,
+        )?;
+        Ok(Some((flows_by_date, income_by_date)))
     }
 
     fn prepare_valuation_account(
@@ -2289,13 +2490,21 @@ impl ValuationService {
             )?,
             _ => None,
         };
-        Self::calculate_prepared_valuation_account_from_facts(account, facts, flows.as_ref())
+        let flows_by_date = flows.as_ref().map(|(f, _)| f);
+        let income_by_date = flows.as_ref().map(|(_, i)| i);
+        Self::calculate_prepared_valuation_account_from_facts(
+            account,
+            facts,
+            flows_by_date,
+            income_by_date,
+        )
     }
 
     fn calculate_prepared_valuation_account_from_facts(
         account: PreparedValuationAccount,
         facts: &SharedValuationFacts,
         flows: Option<&HashMap<NaiveDate, DailyFlowAmounts>>,
+        income: Option<&BTreeMap<NaiveDate, Decimal>>,
     ) -> CoreResult<AccountValuationCalculation> {
         if account.timeline.is_empty() {
             let persistence = if account.timeline.has_deferred_future_snapshots() {
@@ -2418,19 +2627,22 @@ impl ValuationService {
             )));
         }
 
+        let empty_income = BTreeMap::new();
+        let income = income.unwrap_or(&empty_income);
         if let Some(flows) = flows {
             Self::set_external_flows_from_activity_map_or_net_contribution_base(
                 &mut valuations,
                 flows,
+                income,
                 false,
             );
         } else {
-            Self::set_external_flows_from_net_contribution_base(&mut valuations, false);
+            Self::set_external_flows_from_net_contribution_base(&mut valuations, income, false);
         }
         // After generic flow stamping so inferred transitions (including the
         // Unknown marker for unpriceable ones) are authoritative on holdings
         // rows and can't be relabeled by the fallback pass.
-        Self::apply_inferred_holdings_external_flows(&mut valuations, &account, facts);
+        Self::apply_inferred_holdings_external_flows(&mut valuations, &account, facts, income);
         if let Some(anchor_date) = account.incremental_anchor_date {
             valuations.retain(|valuation| valuation.valuation_date != anchor_date);
         }
@@ -2450,6 +2662,7 @@ impl ValuationService {
         account: PreparedValuationAccount,
         facts: &SharedValuationFacts,
         flows: Option<&HashMap<NaiveDate, DailyFlowAmounts>>,
+        income: Option<&BTreeMap<NaiveDate, Decimal>>,
     ) -> CoreResult<AccountValuationCalculation> {
         if account.timeline.is_empty() {
             let persistence = if account.timeline.has_deferred_future_snapshots() {
@@ -2572,19 +2785,22 @@ impl ValuationService {
             )));
         }
 
+        let empty_income = BTreeMap::new();
+        let income = income.unwrap_or(&empty_income);
         if let Some(flows) = flows {
             Self::set_external_flows_from_activity_map_or_net_contribution_base(
                 &mut valuations,
                 flows,
+                income,
                 false,
             );
         } else {
-            Self::set_external_flows_from_net_contribution_base(&mut valuations, false);
+            Self::set_external_flows_from_net_contribution_base(&mut valuations, income, false);
         }
         // After generic flow stamping so inferred transitions (including the
         // Unknown marker for unpriceable ones) are authoritative on holdings
         // rows and can't be relabeled by the fallback pass.
-        Self::apply_inferred_holdings_external_flows(&mut valuations, &account, facts);
+        Self::apply_inferred_holdings_external_flows(&mut valuations, &account, facts, income);
         if let Some(anchor_date) = account.incremental_anchor_date {
             valuations.retain(|valuation| valuation.valuation_date != anchor_date);
         }
@@ -2819,10 +3035,13 @@ impl ValuationServiceTrait for ValuationService {
             )?,
             _ => None,
         };
+        let flows_by_date = flows.as_ref().map(|(f, _)| f);
+        let income_by_date = flows.as_ref().map(|(_, i)| i);
         let calculation = Self::calculate_prepared_valuation_account_dense_reference(
             account,
             &facts,
-            flows.as_ref(),
+            flows_by_date,
+            income_by_date,
         )?;
         self.persist_account_valuation(calculation).await
     }
@@ -3765,6 +3984,7 @@ mod tests {
             account.clone(),
             &facts,
             Some(&flows),
+            None,
         )
         .expect("interval valuation should succeed")
         .valuations;
@@ -3772,6 +3992,7 @@ mod tests {
             account,
             &facts,
             Some(&flows),
+            None,
         )
         .expect("dense reference valuation should succeed")
         .valuations;
@@ -3855,6 +4076,7 @@ mod tests {
             account.clone(),
             &facts,
             Some(&flows),
+            None,
         )
         .expect("interval valuation should retain the unpriced day")
         .valuations;
@@ -3862,6 +4084,7 @@ mod tests {
             account,
             &facts,
             Some(&flows),
+            None,
         )
         .expect("dense valuation should retain the unpriced day")
         .valuations;
@@ -3982,6 +4205,7 @@ mod tests {
             account.clone(),
             &facts,
             Some(&flows),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4011,6 +4235,7 @@ mod tests {
             account,
             &facts,
             Some(&flows),
+            None,
         )
         .expect("dense reference valuation should succeed")
         .valuations;
@@ -4023,6 +4248,313 @@ mod tests {
             dense_transition.external_flow_source,
             ExternalFlowSource::QuoteDerivedMarketValue
         );
+    }
+
+    /// A cash-only, Pluggy-style holdings account (no positions - matches a
+    /// linked bank/reserve account such as DolarApp) at two keyframes, both
+    /// non-`Calculated` so `apply_inferred_holdings_external_flows` runs.
+    fn cash_only_prepared_account(timeline: HoldingsTimeline) -> PreparedValuationAccount {
+        PreparedValuationAccount {
+            account_id: "account-1".to_string(),
+            timeline,
+            incremental_anchor_date: None,
+            replace_since_date: None,
+            required_asset_ids: HashSet::new(),
+            required_fx_pairs: HashSet::new(),
+            acquisition_fx_requests: HashSet::new(),
+            base_currency: "USD".to_string(),
+            account_currency: "USD".to_string(),
+        }
+    }
+
+    fn cash_only_facts() -> SharedValuationFacts {
+        SharedValuationFacts {
+            quotes_by_asset: HashMap::new(),
+            assets_with_quotes: HashSet::new(),
+            split_events: Vec::new(),
+            fx_rates_by_pair: BTreeMap::new(),
+        }
+    }
+
+    fn cash_snapshot(snapshot_date: &str, cash: Decimal) -> AccountStateSnapshot {
+        let date = date(snapshot_date);
+        AccountStateSnapshot {
+            id: format!("account-1-{snapshot_date}"),
+            account_id: "account-1".to_string(),
+            snapshot_date: date,
+            currency: "USD".to_string(),
+            positions: HashMap::new(),
+            cash_balances: HashMap::from([("USD".to_string(), cash)]),
+            cost_basis: Decimal::ZERO,
+            net_contribution: Decimal::ZERO,
+            net_contribution_base: Decimal::ZERO,
+            cash_total_account_currency: cash,
+            cash_total_base_currency: cash,
+            calculated_at: activity_time(snapshot_date).naive_utc(),
+            source: SnapshotSource::BrokerImported,
+        }
+    }
+
+    // --- Regression coverage: known INTEREST/DIVIDEND between valuation
+    // keyframes must never be swallowed by NetContributionFallback (the
+    // activity-map/net-contribution fallback path) or QuoteDerivedMarketValue
+    // (the holdings-keyframe inference path). Both stages consult
+    // `income_by_date` for the gap `(prev.valuation_date, curr.valuation_date]`
+    // before classifying any residual as external flow.
+
+    #[test]
+    fn activity_map_fallback_rescues_income_between_keyframes() {
+        // net_contribution_base stays flat across the quiet 05-02 row (no
+        // keyframe change yet) and only jumps on 05-03, when the +80 delta
+        // is fully explained by two INTEREST postings recorded inside the
+        // gap - one on the quiet day, one on the jump day itself.
+        let mut values = vec![
+            valuation(
+                "a1",
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "a1",
+                "2026-05-02",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "a1",
+                "2026-05-03",
+                dec!(1080),
+                dec!(1080),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        let income_by_date = BTreeMap::from([
+            (date("2026-05-02"), dec!(50)),
+            (date("2026-05-03"), dec!(30)),
+        ]);
+
+        ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
+            &mut values,
+            &HashMap::new(),
+            &income_by_date,
+            false,
+        );
+
+        let curr = &values[2];
+        assert_eq!(curr.external_inflow_base, Decimal::ZERO);
+        assert_eq!(curr.external_outflow_base, Decimal::ZERO);
+        assert_eq!(curr.external_flow_source, ExternalFlowSource::NoFlow);
+    }
+
+    #[test]
+    fn activity_map_fallback_nets_income_against_same_gap_transfer_in() {
+        // +80 income plus a +500 real deposit in the same gap: only the
+        // deposit is capital flow; the income stays return.
+        let mut values = vec![
+            valuation(
+                "a1",
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "a1",
+                "2026-05-02",
+                dec!(1580),
+                dec!(1580),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        let income_by_date = BTreeMap::from([(date("2026-05-02"), dec!(80))]);
+
+        ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
+            &mut values,
+            &HashMap::new(),
+            &income_by_date,
+            false,
+        );
+
+        let curr = &values[1];
+        assert_eq!(curr.external_inflow_base, dec!(500));
+        assert_eq!(curr.external_outflow_base, Decimal::ZERO);
+        assert_eq!(
+            curr.external_flow_source,
+            ExternalFlowSource::NetContributionFallback
+        );
+    }
+
+    #[test]
+    fn activity_map_fallback_nets_income_against_same_gap_withdrawal() {
+        // Balance falls from 1000 to 780 despite +80 of income earned inside
+        // the gap: the real withdrawal was 300 (income kept it from falling
+        // further), and that full 300 - not the smaller net observed delta -
+        // is the capital outflow.
+        let mut values = vec![
+            valuation(
+                "a1",
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "a1",
+                "2026-05-02",
+                dec!(780),
+                dec!(780),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        let income_by_date = BTreeMap::from([(date("2026-05-02"), dec!(80))]);
+
+        ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
+            &mut values,
+            &HashMap::new(),
+            &income_by_date,
+            false,
+        );
+
+        let curr = &values[1];
+        assert_eq!(curr.external_inflow_base, Decimal::ZERO);
+        assert_eq!(curr.external_outflow_base, dec!(300));
+        assert_eq!(
+            curr.external_flow_source,
+            ExternalFlowSource::NetContributionFallback
+        );
+    }
+
+    #[test]
+    fn net_contribution_base_fallback_preserves_realized_return_on_withdrawn_interest() {
+        // Same shape as the activity-map test above, but exercised through
+        // the no-activity-repository fallback: interest that was withdrawn
+        // (net delta = income - withdrawal) still shows as realized return,
+        // not a loss of return, in the residual it leaves behind.
+        let mut values = vec![
+            valuation(
+                "a1",
+                "2026-05-01",
+                dec!(1000),
+                dec!(1000),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+            valuation(
+                "a1",
+                "2026-05-02",
+                dec!(1030),
+                dec!(1030),
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
+        ];
+        // 80 of interest accrued, 50 of it withdrawn same gap: net contribution
+        // only moved +30, all of which is unexplained-by-income withdrawal.
+        let income_by_date = BTreeMap::from([(date("2026-05-02"), dec!(80))]);
+
+        ValuationService::set_external_flows_from_net_contribution_base(
+            &mut values,
+            &income_by_date,
+            false,
+        );
+
+        let curr = &values[1];
+        // delta (30) - income (80) = -50: a real outflow, i.e. the withdrawn
+        // portion of the interest, never miscounted as negative return.
+        assert_eq!(curr.external_inflow_base, Decimal::ZERO);
+        assert_eq!(curr.external_outflow_base, dec!(50));
+        assert_eq!(
+            curr.external_flow_source,
+            ExternalFlowSource::NetContributionFallback
+        );
+    }
+
+    #[test]
+    fn holdings_inference_rescues_income_for_cash_only_pluggy_style_account() {
+        // Mirrors DolarApp: a cash-only, Pluggy-linked (BrokerImported)
+        // reserve account whose balance jumps at the next sync without a
+        // same-day activity, but two INTEREST postings inside the gap fully
+        // explain the jump. Before this fix, `apply_inferred_holdings_external_flows`
+        // would price this purely from cash deltas and stamp the entire
+        // amount `QuoteDerivedMarketValue` (flow), discarding the return.
+        let start = date("2026-06-01");
+        let end = date("2026-06-04");
+        let first = cash_snapshot("2026-06-01", dec!(50000));
+        let second = cash_snapshot("2026-06-04", dec!(50080));
+        let timeline = HoldingsTimeline::new(Some(start), end, vec![first, second], None, false);
+        let account = cash_only_prepared_account(timeline);
+        let facts = cash_only_facts();
+        let flows: HashMap<NaiveDate, DailyFlowAmounts> = HashMap::new();
+        let income_by_date = BTreeMap::from([
+            (date("2026-06-02"), dec!(50)),
+            (date("2026-06-03"), dec!(30)),
+        ]);
+
+        let valuations = ValuationService::calculate_prepared_valuation_account_from_facts(
+            account,
+            &facts,
+            Some(&flows),
+            Some(&income_by_date),
+        )
+        .expect("valuation should succeed")
+        .valuations;
+
+        let transition = valuations
+            .iter()
+            .find(|valuation| valuation.valuation_date == date("2026-06-04"))
+            .expect("transition day should be present");
+        assert_eq!(transition.external_inflow_base, Decimal::ZERO);
+        assert_eq!(transition.external_outflow_base, Decimal::ZERO);
+        assert_ne!(
+            transition.external_flow_source,
+            ExternalFlowSource::QuoteDerivedMarketValue
+        );
+        assert_ne!(
+            transition.external_flow_source,
+            ExternalFlowSource::NetContributionFallback
+        );
+    }
+
+    #[test]
+    fn holdings_inference_keeps_unexplained_residual_as_flow_not_return() {
+        // Same shape, but the jump (+580) is far larger than the known
+        // income (+80): the unexplained 500 must remain classified as
+        // external flow/reconciliation, never silently promoted to return.
+        let start = date("2026-06-01");
+        let end = date("2026-06-04");
+        let first = cash_snapshot("2026-06-01", dec!(50000));
+        let second = cash_snapshot("2026-06-04", dec!(50580));
+        let timeline = HoldingsTimeline::new(Some(start), end, vec![first, second], None, false);
+        let account = cash_only_prepared_account(timeline);
+        let facts = cash_only_facts();
+        let flows: HashMap<NaiveDate, DailyFlowAmounts> = HashMap::new();
+        let income_by_date = BTreeMap::from([(date("2026-06-02"), dec!(80))]);
+
+        let valuations = ValuationService::calculate_prepared_valuation_account_from_facts(
+            account,
+            &facts,
+            Some(&flows),
+            Some(&income_by_date),
+        )
+        .expect("valuation should succeed")
+        .valuations;
+
+        let transition = valuations
+            .iter()
+            .find(|valuation| valuation.valuation_date == date("2026-06-04"))
+            .expect("transition day should be present");
+        assert_eq!(transition.external_inflow_base, dec!(500));
+        assert_eq!(transition.external_outflow_base, Decimal::ZERO);
     }
 
     #[test]
@@ -4043,6 +4575,7 @@ mod tests {
             holdings_prepared_account(timeline),
             &holdings_quote_facts(),
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4094,6 +4627,7 @@ mod tests {
             account,
             &facts,
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4153,6 +4687,7 @@ mod tests {
             account,
             &facts,
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4205,6 +4740,7 @@ mod tests {
             account,
             &facts,
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4276,6 +4812,7 @@ mod tests {
             account,
             &facts,
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -4346,6 +4883,7 @@ mod tests {
                 account,
                 &facts,
                 Some(&HashMap::new()),
+                None,
             )
             .expect("valuation should succeed")
             .valuations;
@@ -4398,7 +4936,11 @@ mod tests {
         ];
         values[1].external_flow_source = ExternalFlowSource::UnpricedHoldingsTransition;
 
-        ValuationService::set_external_flows_from_net_contribution_base(&mut values, true);
+        ValuationService::set_external_flows_from_net_contribution_base(
+            &mut values,
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(
             values[1].external_flow_source,
             ExternalFlowSource::UnpricedHoldingsTransition
@@ -4411,6 +4953,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &HashMap::new(),
+            &BTreeMap::new(),
             true,
         );
         assert_eq!(
@@ -4432,6 +4975,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &flows,
+            &BTreeMap::new(),
             true,
         );
         assert_eq!(
@@ -4455,6 +4999,7 @@ mod tests {
             holdings_prepared_account(timeline),
             &holdings_quote_facts(),
             Some(&HashMap::new()),
+            None,
         )
         .expect("valuation should succeed")
         .valuations;
@@ -5169,6 +5714,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &flows_by_date,
+            &BTreeMap::new(),
             false,
         );
 
@@ -5215,6 +5761,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &flows_by_date,
+            &BTreeMap::new(),
             false,
         );
         values.retain(|valuation| valuation.valuation_date != anchor_date);
@@ -5264,6 +5811,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &flows_by_date,
+            &BTreeMap::new(),
             false,
         );
 
@@ -6478,7 +7026,11 @@ mod tests {
             ),
         ];
 
-        ValuationService::set_external_flows_from_net_contribution_base(&mut values, false);
+        ValuationService::set_external_flows_from_net_contribution_base(
+            &mut values,
+            &BTreeMap::new(),
+            false,
+        );
 
         assert_eq!(values[1].external_inflow_base, Decimal::ZERO);
         assert_eq!(values[1].external_outflow_base, Decimal::ZERO);
@@ -6513,6 +7065,7 @@ mod tests {
         ValuationService::set_external_flows_from_activity_map_or_net_contribution_base(
             &mut values,
             &flows_by_date,
+            &BTreeMap::new(),
             false,
         );
 
@@ -6740,7 +7293,11 @@ mod tests {
             ),
         ];
 
-        ValuationService::set_external_flows_from_net_contribution_base(&mut values, false);
+        ValuationService::set_external_flows_from_net_contribution_base(
+            &mut values,
+            &BTreeMap::new(),
+            false,
+        );
         values.retain(|valuation| valuation.valuation_date != anchor_date);
 
         assert_eq!(values.len(), 1);
